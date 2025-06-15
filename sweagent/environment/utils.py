@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shlex
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -42,10 +43,233 @@ CTF_CHALLENGES_CATEGORIES = {
     "forensics": "forensics",
 }
 
+# Port management constants
+DEFAULT_PORT_RANGE_START = 10000
+DEFAULT_PORT_RANGE_END = 20000
+
 logger = get_logger("env_utils")
 
 
 class NoOutputTimeoutError(TimeoutError): ...
+
+
+def is_port_in_use(port: int, host: str = 'localhost') -> bool:
+    """Check if a port is currently in use"""
+    import socket
+    
+    # Check if we can bind to the port (TCP)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            return False  # Port is available
+    except OSError:
+        pass  # Port might be in use, check further
+    
+    # Also check if anything is listening on the port
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.1)  # Very short timeout
+            result = sock.connect_ex((host, port))
+            return result == 0  # If connection succeeds, port is in use
+    except:
+        pass
+    
+    return True  # Assume in use if we can't determine
+
+
+def get_available_port(start_port: int = DEFAULT_PORT_RANGE_START, end_port: int = DEFAULT_PORT_RANGE_END, host: str = 'localhost') -> int:
+    """Find an available port in the specified range by checking actual port usage"""
+    import random
+    
+    # Create a randomized list of ports to try to avoid patterns
+    port_range = list(range(start_port, end_port + 1))
+    random.shuffle(port_range)
+    
+    for port in port_range:
+        if not is_port_in_use(port, host):
+            logger.debug(f"Found available port: {port}")
+            return port
+    
+    raise RuntimeError(f"No available ports found in range {start_port}-{end_port}")
+
+
+def get_multiple_available_ports(count: int, start_port: int = DEFAULT_PORT_RANGE_START, end_port: int = DEFAULT_PORT_RANGE_END, host: str = 'localhost') -> list[int]:
+    """Get multiple available ports at once to reduce conflicts"""
+    import random
+    
+    if count <= 0:
+        return []
+    
+    # Create a randomized list of ports to try
+    port_range = list(range(start_port, end_port + 1))
+    random.shuffle(port_range)
+    
+    allocated_ports = []
+    temp_sockets = []
+    
+    try:
+        for port in port_range:
+            if len(allocated_ports) >= count:
+                break
+                
+            if not is_port_in_use(port, host):
+                # Try to temporarily bind to the port to reserve it
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind((host, port))
+                    sock.listen(1)
+                    temp_sockets.append(sock)
+                    allocated_ports.append(port)
+                    logger.debug(f"Reserved port: {port}")
+                except OSError:
+                    continue
+        
+        if len(allocated_ports) < count:
+            raise RuntimeError(f"Could only find {len(allocated_ports)} available ports out of {count} requested in range {start_port}-{end_port}")
+        
+        return allocated_ports
+    
+    finally:
+        # Close all temporary sockets to release the ports
+        for sock in temp_sockets:
+            try:
+                sock.close()
+            except:
+                pass
+
+
+def create_dynamic_docker_compose(
+    original_compose_path: Path, 
+    container_name_suffix: str,
+    dynamic_network_name: str,
+    port_mappings: dict[str, int] | None = None
+) -> Path:
+    """
+    Create a modified docker-compose file with dynamic port mappings and network names.
+    
+    Args:
+        original_compose_path: Path to the original docker-compose.yml
+        container_name_suffix: Unique suffix to append to container names
+        dynamic_network_name: Unique network name for this instance
+        port_mappings: Optional dict mapping original internal ports to new external ports
+    
+    Returns:
+        Path to the temporary modified docker-compose file
+    """
+    import yaml
+    
+    with open(original_compose_path) as f:
+        compose_data = yaml.safe_load(f)
+    
+    # Modify service names and ports
+    if "services" in compose_data:
+        new_services = {}
+        for service_name, service_config in compose_data["services"].items():
+            # Add suffix to service name
+            new_service_name = f"{service_name}-{container_name_suffix}"
+            new_service_config = service_config.copy()
+            
+            # Handle port mappings
+            if "ports" in new_service_config:
+                new_ports = []
+                for port_mapping in new_service_config["ports"]:
+                    if isinstance(port_mapping, str) and ":" in port_mapping:
+                        external_port, internal_port = port_mapping.split(":", 1)
+                        # Use mapped port if available, otherwise find a new one
+                        if port_mappings and internal_port in port_mappings:
+                            new_ports.append(f"{port_mappings[internal_port]}:{internal_port}")
+                        else:
+                            # Try to find an available port for unmapped ports
+                            try:
+                                available_port = get_available_port()
+                                new_ports.append(f"{available_port}:{internal_port}")
+                                if port_mappings is not None:
+                                    port_mappings[internal_port] = available_port
+                                logger.debug(f"Auto-assigned port {available_port} for internal port {internal_port}")
+                            except RuntimeError:
+                                logger.warning(f"Could not find available port for {port_mapping}, keeping original")
+                                new_ports.append(port_mapping)
+                    elif isinstance(port_mapping, int):
+                        # Handle integer port (just internal port specified)
+                        internal_port = str(port_mapping)
+                        if port_mappings and internal_port in port_mappings:
+                            new_ports.append(f"{port_mappings[internal_port]}:{internal_port}")
+                        else:
+                            try:
+                                available_port = get_available_port()
+                                new_ports.append(f"{available_port}:{internal_port}")
+                                if port_mappings is not None:
+                                    port_mappings[internal_port] = available_port
+                                logger.debug(f"Auto-assigned port {available_port} for internal port {internal_port}")
+                            except RuntimeError:
+                                logger.warning(f"Could not find available port for {port_mapping}, keeping original")
+                                new_ports.append(port_mapping)
+                    else:
+                        new_ports.append(port_mapping)
+                new_service_config["ports"] = new_ports
+            elif port_mappings:
+                # No explicit ports in compose file, but we have port mappings to add
+                # This handles cases where the compose file doesn't specify ports but challenge.json does
+                new_ports = []
+                for internal_port, external_port in port_mappings.items():
+                    new_ports.append(f"{external_port}:{internal_port}")
+                    logger.debug(f"Adding port mapping {external_port}:{internal_port} to service {new_service_name}")
+                if new_ports:
+                    new_service_config["ports"] = new_ports
+            
+            # Update network references
+            if "networks" in new_service_config:
+                if isinstance(new_service_config["networks"], list):
+                    # Simple list format
+                    new_networks = []
+                    for net in new_service_config["networks"]:
+                        if net == "ctfnet":
+                            new_networks.append(dynamic_network_name)
+                        else:
+                            new_networks.append(net)
+                    new_service_config["networks"] = new_networks
+                elif isinstance(new_service_config["networks"], dict):
+                    # Dict format with aliases
+                    new_networks = {}
+                    for net_name, net_config in new_service_config["networks"].items():
+                        if net_name == "ctfnet":
+                            new_networks[dynamic_network_name] = net_config
+                        else:
+                            new_networks[net_name] = net_config
+                    new_service_config["networks"] = new_networks
+            
+            new_services[new_service_name] = new_service_config
+        
+        compose_data["services"] = new_services
+    
+    # Update network definitions
+    if "networks" in compose_data:
+        new_networks = {}
+        for net_name, net_config in compose_data["networks"].items():
+            if net_name == "ctfnet":
+                # Create a new internal network instead of external
+                new_networks[dynamic_network_name] = {
+                    "driver": "bridge",
+                    "name": dynamic_network_name
+                }
+            else:
+                new_networks[net_name] = net_config
+        compose_data["networks"] = new_networks
+    
+    # Create temporary file for modified compose
+    temp_compose = tempfile.NamedTemporaryFile(
+        mode='w', 
+        suffix='.yml', 
+        prefix=f'docker-compose-{container_name_suffix}-',
+        delete=False
+    )
+    
+    with temp_compose:
+        yaml.dump(compose_data, temp_compose, default_flow_style=False)
+    
+    return Path(temp_compose.name)
 
 
 def get_data_path_name(data_path: str) -> str:
@@ -394,12 +618,135 @@ def terminate_docker_compose(docker_compose_path: Path) -> None:
         logger.error(f"Unexpected compose termination error: {error}")
 
 
-def attach_network_interface_to_container(container_name: str) -> None:
+def cleanup_dynamic_network(network_name: str) -> None:
+    """
+    Clean up a specific dynamic CTF network.
+    
+    Args:
+        network_name: Name of the network to remove (e.g., 'ctfnet-abc123')
+    """
+    if not network_name or network_name == "ctfnet":
+        # Don't remove the base ctfnet network
+        return
+    
+    try:
+        client = docker.from_env()
+        network = client.networks.get(network_name)
+        network.remove()
+        logger.debug(f"Cleaned up dynamic network: {network_name}")
+    except docker.errors.NotFound:
+        logger.debug(f"Dynamic network {network_name} not found, likely already removed")
+    except docker.errors.APIError as e:
+        logger.warning(f"Failed to remove dynamic network {network_name}: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error removing dynamic network {network_name}: {e}")
+
+
+def cleanup_all_dynamic_networks() -> None:
+    """
+    Comprehensive cleanup of ALL dynamic CTF networks.
+    This function finds and removes all networks matching the 'ctfnet-*' pattern,
+    similar to the external cleanup script approach.
+    """
+    try:
+        client = docker.from_env()
+        networks = client.networks.list()
+        
+        # Find all dynamic ctfnet networks (those starting with 'ctfnet-')
+        dynamic_networks = [net for net in networks if net.name.startswith('ctfnet-')]
+        
+        if dynamic_networks:
+            logger.debug(f"Found {len(dynamic_networks)} dynamic CTF networks to clean up")
+            for network in dynamic_networks:
+                try:
+                    # First try to remove directly
+                    network.remove()
+                    logger.debug(f"Cleaned up dynamic network: {network.name}")
+                except docker.errors.APIError as e:
+                    if "has active endpoints" in str(e):
+                        # Network has active containers, try to disconnect them first
+                        logger.debug(f"Network {network.name} has active endpoints, disconnecting containers...")
+                        try:
+                            # Reload network to get fresh endpoint info
+                            network.reload()
+                            # Disconnect all containers from this network
+                            for container_id, endpoint_config in network.attrs.get('Containers', {}).items():
+                                try:
+                                    container = client.containers.get(container_id)
+                                    network.disconnect(container, force=True)
+                                    logger.debug(f"Disconnected container {container.name} from network {network.name}")
+                                except Exception as disconnect_e:
+                                    logger.debug(f"Failed to disconnect container {container_id}: {disconnect_e}")
+                            
+                            # Now try to remove the network again
+                            network.remove()
+                            logger.debug(f"Cleaned up dynamic network after disconnecting containers: {network.name}")
+                        except Exception as cleanup_e:
+                            logger.warning(f"Failed to forcefully clean up network {network.name}: {cleanup_e}")
+                    else:
+                        logger.warning(f"Failed to remove dynamic network {network.name}: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error removing dynamic network {network.name}: {e}")
+        else:
+            logger.debug("No dynamic CTF networks found to clean up")
+    
+    except docker.errors.DockerException as e:
+        logger.warning(f"Docker error during network cleanup: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error during comprehensive network cleanup: {e}")
+
+
+def cleanup_dynamic_resources() -> None:
+    """
+    Comprehensive cleanup of dynamic CTF resources including networks and temporary files.
+    This function provides thorough cleanup similar to the external cleanup script.
+    """
+    # Clean up all dynamic networks
+    cleanup_all_dynamic_networks()
+    
+    # Clean up temporary docker-compose files
+    try:
+        import glob
+        temp_files = glob.glob('/tmp/docker-compose-*')
+        for temp_file in temp_files:
+            try:
+                Path(temp_file).unlink()
+                logger.debug(f"Cleaned up temporary file: {temp_file}")
+            except FileNotFoundError:
+                pass  # File already removed
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary file {temp_file}: {e}")
+        if temp_files:
+            logger.debug(f"Cleaned up {len(temp_files)} temporary docker-compose files")
+    except Exception as e:
+        logger.warning(f"Error during temporary file cleanup: {e}")
+
+
+def attach_network_interface_to_container(container_name: str, network_name: str = "ctfnet") -> None:
+    """
+    Attach a network interface to a container.
+    
+    Args:
+        container_name: Name of the container to attach network to
+        network_name: Name of the network to attach (defaults to 'ctfnet')
+    """
+    # First ensure the network exists
+    client = docker.from_env()
+    try:
+        client.networks.get(network_name)
+    except docker.errors.NotFound:
+        # Create the network if it doesn't exist
+        try:
+            client.networks.create(network_name, driver="bridge")
+            logger.debug(f"Created network {network_name}")
+        except docker.errors.APIError as e:
+            logger.warning(f"Failed to create network {network_name}: {e}")
+    
     cmd = [
         "docker",
         "network",
         "connect",
-        "ctfnet",
+        network_name,
         container_name,
     ]
     logger.debug("Attaching NIC to container with command: %s", shlex.join(cmd))
@@ -417,12 +764,95 @@ def attach_network_interface_to_container(container_name: str) -> None:
         raise RuntimeError(error)
 
 
-def get_docker_compose(docker_compose_path: Path) -> Path:
+def get_docker_compose(
+    docker_compose_path: Path, 
+    container_name_suffix: str | None = None,
+    dynamic_ports: bool = False,
+    challenge_internal_port: int | None = None
+) -> tuple[Path, dict[str, int]]:
+    """
+    Start docker-compose services with optional dynamic port allocation.
+    
+    Args:
+        docker_compose_path: Path to the docker-compose.yml file
+        container_name_suffix: Optional suffix for container names to avoid conflicts
+        dynamic_ports: If True, use dynamic port allocation to avoid conflicts
+        challenge_internal_port: Optional internal port from challenge.json that should be exposed
+        
+    Returns:
+        Tuple of (compose_path, port_mappings) where port_mappings maps internal ports to external ports
+    """
+    actual_compose_path = docker_compose_path
+    port_mappings = {}
+    
+    if dynamic_ports and container_name_suffix:
+        # Generate unique network name for this instance
+        dynamic_network_name = f"ctfnet-{container_name_suffix}"
+        
+        # Get available ports for the services
+        import yaml
+        try:
+            with open(docker_compose_path) as f:
+                compose_data = yaml.safe_load(f)
+            
+            # Collect all internal ports that need mapping
+            if "services" in compose_data:
+                for service_config in compose_data["services"].values():
+                    if "ports" in service_config:
+                        for port_mapping in service_config["ports"]:
+                            if isinstance(port_mapping, str) and ":" in port_mapping:
+                                external_port, internal_port = port_mapping.split(":", 1)
+                                try:
+                                    available_port = get_available_port()
+                                    port_mappings[internal_port] = available_port
+                                    logger.debug(f"Mapped internal port {internal_port} to external port {available_port}")
+                                except RuntimeError as e:
+                                    logger.warning(f"Could not allocate dynamic port for {internal_port}: {e}")
+                            elif isinstance(port_mapping, int):
+                                # Handle integer port (just internal port specified)
+                                internal_port = str(port_mapping)
+                                try:
+                                    available_port = get_available_port()
+                                    port_mappings[internal_port] = available_port
+                                    logger.debug(f"Mapped internal port {internal_port} to external port {available_port}")
+                                except RuntimeError as e:
+                                    logger.warning(f"Could not allocate dynamic port for {internal_port}: {e}")
+            
+            # Handle challenge internal port if specified and not already mapped
+            if challenge_internal_port is not None:
+                internal_port_str = str(challenge_internal_port)
+                if internal_port_str not in port_mappings:
+                    try:
+                        available_port = get_available_port()
+                        port_mappings[internal_port_str] = available_port
+                        logger.debug(f"Mapped challenge internal port {internal_port_str} to external port {available_port}")
+                    except RuntimeError as e:
+                        logger.warning(f"Could not allocate dynamic port for challenge internal port {internal_port_str}: {e}")
+                        
+        except Exception as e:
+            logger.warning(f"Failed to parse compose file for dynamic ports: {e}")
+            dynamic_ports = False
+        
+        if port_mappings:
+            # Create modified docker-compose file
+            try:
+                actual_compose_path = create_dynamic_docker_compose(
+                    docker_compose_path, 
+                    container_name_suffix,
+                    dynamic_network_name,
+                    port_mappings
+                )
+                logger.info(f"Created dynamic docker-compose at {actual_compose_path} with port mappings: {port_mappings}")
+            except Exception as e:
+                logger.error(f"Failed to create dynamic docker-compose: {e}")
+                actual_compose_path = docker_compose_path
+                port_mappings = {}
+    
     startup_cmd = [
         "docker",
         "compose",
         "-f",
-        str(docker_compose_path),
+        str(actual_compose_path),
         "up",
         "-d",
         "--force-recreate",
@@ -439,7 +869,8 @@ def get_docker_compose(docker_compose_path: Path) -> Path:
     _, error = compose.communicate(timeout=DOCKER_COMPOSE_STARTUP_DELAY)
     if error:
         logger.error(f"Unexpected compose setup error: {error}")
-    return docker_compose_path
+    
+    return actual_compose_path, port_mappings
 
 
 def _get_container_mounts_list(container_mounts: list[str]) -> list[docker.types.Mount]:
@@ -731,18 +1162,29 @@ class InstanceBuilder:
         self.args["instance_id"] = f"{owner}__{repo}-i{issue_number}"
         self.args["problem_statement_source"] = "online"
 
-    def set_server_description(self, server_name: str | None, port: int | None) -> None:
-        """For CTF challenges"""
+    def set_server_description(self, server_name: str | None, port: int | None, external_port: int | None = None) -> None:
+        """For CTF challenges
+        
+        Args:
+            server_name: The server hostname/alias 
+            port: The internal port the service runs on
+            external_port: The external port mapped to the internal port (for dynamic port mapping)
+        """
         if server_name is None or port is None:
             self.args["challenge"]["server_description"] = ""
             return
+        
+        # IMPORTANT: For container-to-container communication, ALWAYS use internal port and service name
+        # External ports are only for host-to-container communication
+        # Since the agent runs inside a container, it should use the service name and internal port
+        
         if self.args["challenge"]["category"] in {"web", "misc"} and self.args["challenge"].get("proto") != "nc":
             self.args["challenge"]["server_description"] = (
                 f"The challenge web server is running on `{server_name}` port `{port}` and you can access it from within the container environment using `curl http://{server_name}:{port}`."
             )
         else:
             self.args["challenge"]["server_description"] = (
-                f"The challenge web server is running on `{server_name}` port `{port}` and you can access it from within the container environment using `connect_start {server_name} {port}`."
+                f"The challenge server is running on `{server_name}` port `{port}` and you can access it from within the container environment using `connect_start {server_name} {port}`."
             )
 
     def set_problem_statement_from_challenge_json(self, file_path: str) -> None:
@@ -867,6 +1309,27 @@ class InstanceBuilder:
         self.set_missing_fields()
         self.validate()
         return self.args
+
+    def update_server_description_with_port_mapping(self, port_mappings: dict[str, int]) -> None:
+        """Update server description after dynamic port mapping is established
+        
+        Args:
+            port_mappings: Dictionary mapping internal ports (as strings) to external ports
+        """
+        if "challenge" not in self.args:
+            return
+            
+        challenge = self.args["challenge"]
+        internal_port = challenge.get("port")
+        server_name = challenge.get("server_name")
+        
+        if internal_port is not None and str(internal_port) in port_mappings:
+            external_port = port_mappings[str(internal_port)]
+            # Update the server description with the external port
+            self.set_server_description(server_name, internal_port, external_port)
+            # Store the port mapping info for reference
+            challenge["external_port"] = external_port
+            challenge["port_mapping"] = port_mappings
 
 
 def get_instances(
@@ -1157,3 +1620,71 @@ class PatchFormatter:
 def extract_flag_format(flag: str) -> str:
     flag_format = re.sub(r"{.*}$", "{...}", flag)
     return flag_format if flag_format != flag else "..."
+
+
+def force_cleanup_all_ctf_resources() -> dict[str, int]:
+    """
+    Force cleanup of ALL CTF-related resources. 
+    This is a comprehensive cleanup function that can be used for manual cleanup
+    or in cleanup scripts. It mimics the behavior of the external cleanup script.
+    
+    Returns:
+        Dictionary with counts of cleaned up resources
+    """
+    cleanup_stats = {
+        "networks_removed": 0,
+        "temp_files_removed": 0,
+        "errors": 0
+    }
+    
+    try:
+        client = docker.from_env()
+        
+        # Find and remove all CTF networks (ctfnet-* and ctfnet)
+        networks = client.networks.list()
+        ctf_networks = [net for net in networks if net.name.startswith('ctfnet')]
+        
+        for network in ctf_networks:
+            try:
+                # Try to remove the network
+                network.remove()
+                cleanup_stats["networks_removed"] += 1
+                logger.info(f"Removed CTF network: {network.name}")
+            except docker.errors.APIError as e:
+                if "has active endpoints" in str(e):
+                    logger.warning(f"Network {network.name} has active containers, skipping")
+                elif "not found" in str(e).lower():
+                    logger.debug(f"Network {network.name} already removed")
+                else:
+                    logger.warning(f"Failed to remove network {network.name}: {e}")
+                    cleanup_stats["errors"] += 1
+            except Exception as e:
+                logger.warning(f"Unexpected error removing network {network.name}: {e}")
+                cleanup_stats["errors"] += 1
+    
+    except docker.errors.DockerException as e:
+        logger.error(f"Docker error during comprehensive cleanup: {e}")
+        cleanup_stats["errors"] += 1
+    except Exception as e:
+        logger.error(f"Unexpected error during comprehensive cleanup: {e}")
+        cleanup_stats["errors"] += 1
+    
+    # Clean up temporary files
+    try:
+        import glob
+        temp_files = glob.glob('/tmp/docker-compose-*')
+        for temp_file in temp_files:
+            try:
+                Path(temp_file).unlink()
+                cleanup_stats["temp_files_removed"] += 1
+                logger.debug(f"Removed temporary file: {temp_file}")
+            except FileNotFoundError:
+                pass  # Already removed
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary file {temp_file}: {e}")
+                cleanup_stats["errors"] += 1
+    except Exception as e:
+        logger.warning(f"Error during temporary file cleanup: {e}")
+        cleanup_stats["errors"] += 1
+    
+    return cleanup_stats

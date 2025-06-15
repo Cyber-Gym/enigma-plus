@@ -6,7 +6,8 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, fields
 from pathlib import Path
-
+import boto3
+from botocore.config import Config
 import together
 from anthropic import AI_PROMPT, HUMAN_PROMPT, Anthropic, AnthropicBedrock
 from groq import Groq
@@ -22,11 +23,37 @@ from tenacity import (
 from sweagent.agent.commands import Command
 from sweagent.utils.config import keys_config
 from sweagent.utils.log import get_logger
+import requests  # Add this import for HTTP requests
+import re
 
 logger = get_logger("api_models")
 
 _MAX_RETRIES = int(keys_config.get("SWE_AGENT_MODEL_MAX_RETRIES", 10))
 
+def clean_result(result):
+    # First, split on </think> and take everything after the first one (if any)
+    if "</think>" in result:
+        content = " ".join(result.split("</think>")[1:])
+    else:
+        content = result
+    # print(f"Content: {result}")
+    # exit()
+    # # Now, remove all <|...|> patterns including Unicode variants
+    import re
+    # # Remove all <|...|> patterns - this pattern matches < followed by any pipe-like character, then any content, then pipe-like character and >
+    
+    # Also remove specific tool call patterns
+    tool_patterns = [
+        r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>",
+        r"<｜tool▁calls▁begin｜>.*?<｜tool▁calls▁end｜>",
+    ]
+    # Use a loop to handle nested patterns
+    for pattern in tool_patterns:
+        while re.search(pattern, content, flags=re.DOTALL):
+            content = re.sub(pattern, "", content, flags=re.DOTALL)
+
+    content = content.replace("<｜tool▁call▁begin｜>", "").replace("<｜tool▁call▁end｜>", "").replace("<｜tool▁calls▁begin｜>", "").replace("<｜tool▁calls▁end｜>", "")
+    return content.strip()
 
 @dataclass(frozen=True)
 class ModelArguments(FrozenSerializable):
@@ -42,10 +69,14 @@ class ModelArguments(FrozenSerializable):
     temperature: float = 0.0
     # Sampling top-p
     top_p: float = 1.0
+    # Sampling top-k
+    top_k: int = 20
     # Path to replay file when using the replay model
     replay_path: str | None = None
     # Host URL when using Ollama model
     host_url: str = "localhost:11434"
+    # Maximum number of steps (environment interactions) per instance (0 = unlimited)
+    per_instance_step_limit: int = 0
 
 
 @dataclass
@@ -245,6 +276,71 @@ class OpenAIModel(BaseModel):
             "cost_per_input_token": 3e-6,
             "cost_per_output_token": 12e-6,
         },
+        "deepseek-reasoner": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/efs/people/dhantian/public_models/DeepSeek-R1-0528/": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "Qwen/Qwen2.5-7B-Instruct": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "Qwen/Qwen2.5-14B-Instruct": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "Qwen/Qwen2.5-32B-Instruct": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "Qwen/Qwen3-8B": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "Qwen/Qwen3-14B": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "Qwen/Qwen3-32B": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "SWE-bench/SWE-agent-LM-32B": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "mistralai/Devstral-Small-2505": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/efs/people/zhuoterq/agent-qwen3-step619_0601": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0610": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0611_ablate": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
     }
 
     SHORTCUTS = {
@@ -260,6 +356,19 @@ class OpenAIModel(BaseModel):
         "gpt4omini": "gpt-4o-mini-2024-07-18",
         "o1": "o1-preview-2024-09-12",
         "o1-mini": "o1-mini-2024-09-12",
+        "deepseek-r1": "deepseek-reasoner",
+        "deepseek-r1-0528": "/mnt/efs/people/dhantian/public_models/DeepSeek-R1-0528/",
+        "qwen2-5-7b": "Qwen/Qwen2.5-7B-Instruct",
+        "qwen2-5-14b": "Qwen/Qwen2.5-14B-Instruct",
+        "qwen2-5-32b": "Qwen/Qwen2.5-32B-Instruct",
+        "qwen3-8b": "Qwen/Qwen3-8B",
+        "qwen3-14b": "Qwen/Qwen3-14B",
+        "qwen3-32b": "Qwen/Qwen3-32B",
+        "swe-agent-lm-32b": "SWE-bench/SWE-agent-LM-32B",
+        "devstral-small-2505": "mistralai/Devstral-Small-2505",
+        "agent-qwen3-step619_0601": "/mnt/efs/people/zhuoterq/agent-qwen3-step619_0601",
+        "agent-qwen3-2e_0610": "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0610",
+        "agent-qwen3-2e_0611_ablate": "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0611_ablate",
     }
 
     def __init__(self, args: ModelArguments, commands: list[Command]):
@@ -320,6 +429,7 @@ class OpenAIModel(BaseModel):
                 temperature=self.args.temperature,
                 top_p=self.args.top_p,
             )
+
         except BadRequestError as e:
             logger.exception("BadRequestError")
             if "context window" in str(e) or getattr(e, "error", {}).get("code") == "context_length_exceeded":
@@ -331,7 +441,7 @@ class OpenAIModel(BaseModel):
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
         self.update_stats(input_tokens, output_tokens)
-        return response.choices[0].message.content
+        return clean_result(response.choices[0].message.content)
 
 
 class DeepSeekModel(OpenAIModel):
@@ -529,6 +639,24 @@ class BedrockModel(BaseModel):
             "cost_per_input_token": 2.5e-07,
             "cost_per_output_token": 1.25e-06,
         },
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0": {
+            "max_context": 200_000,
+            "max_tokens": 4096,
+            "cost_per_input_token": 3e-06,
+            "cost_per_output_token": 1.5e-05,
+        },
+        "us.anthropic.claude-3-7-sonnet-20250219-v1:0": {
+            "max_context": 200_000,
+            "max_tokens": 4096,
+            "cost_per_input_token": 3e-06,
+            "cost_per_output_token": 1.5e-05,
+        },
+        "us.deepseek.r1-v1:0": {
+            "max_context": 128_000,
+            "max_tokens": 4096,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
     }
 
     def __init__(self, args: ModelArguments, commands: list[Command]):
@@ -541,6 +669,15 @@ class BedrockModel(BaseModel):
             # Note: this assumes AWS credentials are already configured.
             # https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html
             self.api = AnthropicBedrock()
+        elif self.model_provider == "us":
+            # For DeepSeek models, use native Bedrock client
+            config = Config(
+                retries={
+                    "max_attempts": 100,
+                    "mode": "standard"
+                }
+            )
+            self.api = boto3.client('bedrock-runtime', config=config, region_name='us-west-2')
         elif self.model_provider in ["ai21", "amazon", "cohere", "meta", "mistral"]:
             msg = f"{self.api_model} is not supported!"
             raise NotImplementedError(msg)
@@ -558,6 +695,12 @@ class BedrockModel(BaseModel):
         """
         if self.model_provider == "anthropic":
             return anthropic_history_to_messages(self, history, is_demonstration)
+        elif self.model_provider == "us":
+            # For DeepSeek models, return messages in standard format
+            if is_demonstration:
+                history = [entry for entry in history if entry["role"] != "system"]
+                return "\n".join([entry["content"] for entry in history])
+            return [{k: v for k, v in entry.items() if k in ["role", "content"]} for entry in history]
         else:
             msg = f"{self.api_model} is not supported!"
             raise NotImplementedError(msg)
@@ -574,9 +717,88 @@ class BedrockModel(BaseModel):
         """
         if self.model_provider == "anthropic":
             return anthropic_query(self, history)
-        else:
+        elif self.model_provider == "us":
+            for _ in range(5):
+                response = deepseek_query(self, history)
+                if response:
+                    return response
+            
             msg = f"{self.api_model} is not supported!"
             raise NotImplementedError(msg)
+
+
+def deepseek_query(model: BedrockModel, history: list[dict[str, str]]) -> str:
+    """
+    Query DeepSeek models via Amazon Bedrock with the given `history` and return the response.
+    """
+    # Get system message(s) and user messages
+    system_message = "\n".join([entry["content"] for entry in history if entry["role"] == "system"])
+    
+    # Convert messages to Bedrock format
+    messages = []
+    for entry in history:
+        if entry["role"] != "system":  # Skip system messages as they're handled separately
+            # Ensure content is not empty
+            content = entry.get("content", "").strip()
+            if content:  # Only add non-empty messages
+                messages.append({
+                    "role": entry["role"],
+                    "content": [{"text": content}]
+                })
+    
+    # Ensure we have at least one message
+    if not messages:
+        # If no messages, add a default user message
+        messages = [{"role": "user", "content": [{"text": "Hello"}]}]
+    
+    # Prepare system prompts - only include if there's a system message
+    system_prompts = [{"text": system_message}] if system_message.strip() else None
+
+    # Configure inference parameters
+    inference_config = {
+        "temperature": max(0.0, min(1.0, model.args.temperature)),  # Clamp temperature between 0 and 1
+        "maxTokens": model.model_metadata["max_tokens"],  # Ensure maxTokens doesn't exceed limits
+    }
+    
+    # Add top_p if it's not the default value
+    if model.args.top_p != 1.0:
+        inference_config["topP"] = max(0.0, min(1.0, model.args.top_p))  # Clamp topP between 0 and 1
+    
+    # Prepare converse parameters
+    converse_params = {
+        "modelId": model.api_model,
+        "messages": messages,
+        "inferenceConfig": inference_config,
+    }
+    
+    # Only add system prompts if they exist
+    if system_prompts:
+        converse_params["system"] = system_prompts
+    
+    # Perform Bedrock API call using converse method
+    response = model.api.converse(**converse_params)
+    
+    # Extract the response content
+    output_message = response["output"]["message"]
+    response_text = ""
+        # Handle reasoning content and regular content
+    for content in output_message["content"]:
+        if content.get("reasoningContent"):
+            # Skip reasoning content for now, but could be included if needed
+            continue
+        else:
+            response_text = content["text"]
+            break
+
+    # Calculate token usage for cost tracking
+    usage = response.get("usage", {})
+    input_tokens = usage.get("inputTokens", 0)
+    output_tokens = usage.get("outputTokens", 0)
+    
+    # Update stats and return response
+    if response_text:
+        model.update_stats(input_tokens, output_tokens)
+        return response_text
 
 
 def anthropic_history_to_messages(
@@ -636,7 +858,7 @@ def anthropic_query(model: AnthropicModel | BedrockModel, history: list[dict[str
     """
     # Preserve behavior for older models
     if model.api_model in ["claude-instant", "claude-2.0", "claude-2.1"] or (
-        isinstance(model, BedrockModel) and model.api_model in ["anthropic.claude-instant-v1", "anthropic.claude-v2"]
+        isinstance(model, BedrockModel) and model.model_provider == "anthropic" and model.api_model in ["anthropic.claude-instant-v1", "anthropic.claude-v2"]
     ):
         # Perform Anthropic API call
         prompt = anthropic_history_to_messages(model, history)
@@ -655,6 +877,7 @@ def anthropic_query(model: AnthropicModel | BedrockModel, history: list[dict[str
             else model.model_metadata["max_tokens_to_sample"],
             temperature=model.args.temperature,
             top_p=model.args.top_p,
+            top_k=model.args.top_k,
         )
         # Calculate + update costs, return response
         response = completion.completion
@@ -987,6 +1210,78 @@ class InstantEmptySubmitTestModel(BaseModel):
         return action
 
 
+class VLLMModel(BaseModel):
+    MODELS = defaultdict(
+        lambda: {
+            "max_context": 32768,
+            "cost_per_input_token": 6e-08,
+            "cost_per_output_token": 15e-08,
+        },
+    )
+
+    def __init__(self, args: ModelArguments, commands: list[Command]):
+        # Parse model name and host
+        if ":" in args.model_name:
+            # e.g. vllm:Qwen/Qwen3-32B
+            _, model_name = args.model_name.split(":", 1)
+        else:
+            model_name = args.model_name
+        # Register the model name in MODELS if not present
+        if model_name not in self.MODELS:
+            self.MODELS[model_name] = self.MODELS[None] if None in self.MODELS else {
+                "max_context": 32768,
+                "cost_per_input_token": 6e-08,
+                "cost_per_output_token": 15e-08,
+            }
+        # Create a new ModelArguments with the correct model_name, preserving other fields
+        new_args = ModelArguments(
+            model_name=model_name,
+            per_instance_cost_limit=args.per_instance_cost_limit,
+            total_cost_limit=args.total_cost_limit,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            replay_path=args.replay_path,
+            host_url=args.host_url,
+        )
+        super().__init__(new_args, commands)
+        self.vllm_model = model_name
+        self.host_url = getattr(args, "host_url", "http://localhost:8000")
+        if not self.host_url.startswith("http"):
+            self.host_url = f"http://{self.host_url}"
+        self.api_url = f"{self.host_url}/v1/chat/completions"
+
+    def history_to_messages(self, history: list[dict[str, str]], is_demonstration: bool = False) -> list[dict[str, str]]:
+        # Remove system messages if it is a demonstration
+        if is_demonstration:
+            history = [entry for entry in history if entry["role"] != "system"]
+            return [{"role": entry["role"], "content": entry["content"]} for entry in history]
+        return [{"role": entry["role"], "content": entry["content"]} for entry in history]
+
+    def query(self, history: list[dict[str, str]]) -> str:
+        payload = {
+            "model": self.vllm_model,
+            "messages": self.history_to_messages(history),
+            "temperature": self.args.temperature,
+            "top_p": self.args.top_p,
+            "top_k": self.args.top_k,
+        }
+        try:
+            response = requests.post(self.api_url, json=payload, timeout=3600)
+            response.raise_for_status()
+            data = response.json()
+            # vLLM returns choices[0].message.content
+            result = data["choices"][0]["message"]["content"]
+            # Use token usage if available
+            usage = data.get("usage", {})
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            self.update_stats(input_tokens, output_tokens)
+            return clean_result(result)
+        except Exception as e:
+            logger.error(f"vLLM API error: {e}")
+            raise
+
+
 def get_model(args: ModelArguments, commands: list[Command] | None = None):
     """
     Returns correct model object given arguments and commands
@@ -1022,6 +1317,8 @@ def get_model(args: ModelArguments, commands: list[Command] | None = None):
         return GroqModel(args, commands)
     elif args.model_name == "instant_empty_submit":
         return InstantEmptySubmitTestModel(args, commands)
+    elif args.model_name.startswith("vllm:"):
+        return VLLMModel(args, commands)
     else:
         msg = f"Invalid model name: {args.model_name}"
         raise ValueError(msg)

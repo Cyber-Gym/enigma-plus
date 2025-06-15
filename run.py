@@ -110,6 +110,8 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
     print_config: bool = True
     # Run the agent in CTF mode (SWE-agent: EnIGMA)
     ctf: bool = False
+    # Custom trajectory output path (if not provided, uses default: trajectories/{username}/{run_name})
+    trajectory_path: str = ""
 
     @property
     def run_name(self) -> str:
@@ -121,12 +123,13 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
 
         temp = self.agent.model.temperature
         top_p = self.agent.model.top_p
+        top_k = self.agent.model.top_k
 
         per_instance_cost_limit = self.agent.model.per_instance_cost_limit
         install_env = self.environment.install_environment
 
         return (
-            f"{model_name}__{data_stem}__{config_stem}__t-{temp:.2f}__p-{top_p:.2f}"
+            f"{model_name}__{data_stem}__{config_stem}__t-{temp:.2f}__p-{top_p:.2f}__k-{top_k}"
             + f"__c-{per_instance_cost_limit:.2f}__install-{int(install_env)}"
             + (f"__{self.suffix}" if self.suffix else "")
         )
@@ -309,7 +312,10 @@ class OpenPRHook(MainHook):
 
 class Main:
     def __init__(self, args: ScriptArguments):
-        self.traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
+        if args.trajectory_path:
+            self.traj_dir = Path(args.trajectory_path) / args.run_name
+        else:
+            self.traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
         self.traj_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%y%m%d%H%M%S")
         log_path = self.traj_dir / f"run-{timestamp}.log"
@@ -376,13 +382,61 @@ class Main:
             setup_args["box"] = challenge.get("server_name")
             setup_args["port"] = challenge.get("port")
             setup_args["server_description"] = challenge.get("server_description")
-        info, trajectory = self.agent.run(
-            setup_args=setup_args,
-            env=self.env,
-            observation=observation,
-            traj_dir=self.traj_dir,
-            return_type="info_trajectory",
-        )
+        
+        # Get step limit from model arguments
+        step_limit = self.args.agent.model.per_instance_step_limit
+        
+        # Create a custom version of the Agent.run method that enforces step limits
+        if step_limit > 0:
+            original_run = self.agent.run
+            
+            def limited_run(*args, **kwargs):
+                # Create a wrapper around the agent._run_step method to count steps
+                original_run_step = self.agent._run_step
+                step_count = 0
+                
+                def step_limited_run_step(observation):
+                    nonlocal step_count
+                    observation, done = original_run_step(observation)
+                    step_count += 1
+                    
+                    if step_count >= step_limit:
+                        logger.info(f"⏹️ Step limit of {step_limit} reached after {step_count} steps")
+                        # Set exit status in agent's info dict
+                        self.agent.info["exit_status"] = f"step_{step_limit}_hit"
+                        # Force early termination
+                        return observation, True
+                    
+                    return observation, done
+                
+                # Replace the _run_step method with our counting version
+                self.agent._run_step = step_limited_run_step
+                
+                try:
+                    # Run the agent with our modified _run_step method
+                    result = original_run(*args, **kwargs)
+                    return result
+                finally:
+                    # Restore original method even if there was an exception
+                    self.agent._run_step = original_run_step
+            
+            # Replace the run method with our limited version
+            self.agent.run = limited_run
+        
+        try:
+            # Run the agent
+            info, trajectory = self.agent.run(
+                setup_args=setup_args,
+                env=self.env,
+                observation=observation,
+                traj_dir=self.traj_dir,
+                return_type="info_trajectory",
+            )
+        finally:
+            # Restore original run method if we modified it
+            if step_limit > 0:
+                self.agent.run = original_run
+            
         self._save_predictions(instance_id, info, challenge)
         for hook in self.hooks:
             hook.on_instance_completed(info=info, trajectory=trajectory)
@@ -461,10 +515,16 @@ class Main:
         data = json.loads(content)
         # If the trajectory has no exit status, it's incomplete and we will redo it
         exit_status = data["info"].get("exit_status", None)
-        if exit_status == "early_exit" or exit_status is None:
+        n_calls = data["info"].get("summarizer", {}).get("n_calls", 0)
+        if (exit_status == "early_exit" or exit_status is None) and n_calls < self.args.agent.model.per_instance_step_limit:
             logger.warning(f"Found existing trajectory with no exit status: {log_path}. Removing.")
             log_path.unlink()
             return False
+
+        # Skip if the task was successfully completed (submitted) or if it's a valid exit status
+        if exit_status == "submitted" or (exit_status is not None and exit_status != "early_exit"):
+            logger.info(f"⏭️ Skipping existing trajectory with exit status '{exit_status}': {log_path}")
+            return True
 
         logger.info(f"⏭️ Skipping existing trajectory: {log_path}")
         return True
@@ -513,11 +573,14 @@ def get_args(args=None) -> ScriptArguments:
                 per_instance_cost_limit=3.0,
                 temperature=0.0,
                 top_p=0.95,
+                top_k=20,
+                per_instance_step_limit=0,
             ),
             config_file=CONFIG_DIR / "default.yaml",
         ),
         actions=ActionsArguments(open_pr=False, skip_if_commits_reference_issue=True),
         ctf=False,
+        trajectory_path="",
     )
 
     # Nicer yaml dumping of multiline strings

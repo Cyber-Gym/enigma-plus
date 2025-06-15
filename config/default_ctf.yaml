@@ -128,3 +128,6 @@ blocklist:
 blocklist_error_template: |
   Interactive operation '{name}' is not supported by this environment.
   Please consider using one of the interactive commands available to you in this environment.
+summarizer_config:
+  function: SimpleSummarizer
+  window_length: 100

@@ -123,21 +123,13 @@ class ThoughtActionParser(ParseFunction):
 
         In this case, only the second code block will be parsed as the action.
         """
-        code_block_pat = re.compile(r"^```(\S*)\s*\n|^```\s*$", re.MULTILINE)
-        stack = []
-        last_valid_block = None
-        for match in code_block_pat.finditer(model_response):
-            if stack and not match.group(1):  # Closing of a code block
-                start = stack.pop()
-                # Check if it's not nested within another block
-                if not stack:
-                    last_valid_block = (start, match)
-            elif match.group(1) is not None:  # Opening of a code block
-                stack.append(match)
-        if last_valid_block:
-            start, end = last_valid_block
-            thought = model_response[: start.start()] + model_response[end.end() :]
-            return thought, model_response[start.end() : end.start()]
+        code_block_pattern = re.compile(r"```(?:\S*)\s*\n(.*?)```", re.DOTALL)
+        code_blocks = code_block_pattern.findall(model_response)
+        if code_blocks:
+            # Remove all code blocks from the model_response for the thought
+            thought = code_block_pattern.sub("", model_response).strip()
+            action = "\n".join(block.strip() for block in code_blocks if block.strip())
+            return thought, action
         msg = "No action found in model response."
         raise FormatError(msg)
 

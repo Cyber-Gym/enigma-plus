@@ -41,6 +41,10 @@ from sweagent.environment.utils import (
     NoOutputTimeoutError,
     PatchFormatter,
     attach_network_interface_to_container,
+    cleanup_dynamic_network,
+    cleanup_all_dynamic_networks,
+    cleanup_dynamic_resources,
+    force_cleanup_all_ctf_resources,
     copy_anything_to_container,
     copy_file_to_container,
     format_trajectory_markdown,
@@ -110,6 +114,8 @@ class EnvironmentArguments(FrozenSerializable):
     )
     # Container mounts - additional folders to mount into the environment (useful for caching)
     container_mounts: list[str] = field(default_factory=list)
+    # Enable dynamic port allocation for CTF challenges to support parallel execution
+    enable_dynamic_ports: bool = False
 
     def __post_init__(self):
         if self.timeout is not None:
@@ -205,6 +211,9 @@ class SWEEnv(gym.Env):
         self.container: subprocess.Popen | None = None
         self.docker_compose: Path | None = None
         self.challenge: dict[str, Any] | None = None
+        # Dynamic port allocation for CTF challenges
+        self.port_mappings: dict[str, int] = {}
+        self.dynamic_network_name: str | None = None
         self._reset_container()
 
         self.interactive_session: InteractiveSession | None = None
@@ -695,7 +704,39 @@ class SWEEnv(gym.Env):
         assert self.container is not None  # mypy
         self.container.terminate()
         if self.docker_compose is not None:
-            terminate_docker_compose(self.docker_compose)
+            try:
+                terminate_docker_compose(self.docker_compose)
+            except KeyboardInterrupt:
+                raise
+            except:
+                self.logger.warning("Failed to terminate docker compose", exc_info=True)
+            else:
+                self.logger.debug("Terminated docker compose")
+            
+            # Clean up temporary docker-compose file if it was dynamically created
+            if self.args.enable_dynamic_ports and str(self.docker_compose).startswith('/tmp/docker-compose-'):
+                try:
+                    self.docker_compose.unlink()
+                    self.logger.debug(f"Cleaned up temporary docker-compose file: {self.docker_compose}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to clean up temporary docker-compose file: {e}")
+        
+        # Clean up dynamic network if it was created
+        if self.args.enable_dynamic_ports:
+            try:
+                # Use comprehensive cleanup to remove ALL dynamic networks
+                cleanup_dynamic_resources()
+                self.logger.debug("Performed comprehensive cleanup of dynamic CTF resources")
+            except Exception as e:
+                self.logger.warning(f"Failed to perform comprehensive cleanup: {e}")
+                # Fallback to single network cleanup if comprehensive cleanup fails
+                if self.dynamic_network_name:
+                    try:
+                        cleanup_dynamic_network(self.dynamic_network_name)
+                        self.logger.debug(f"Fallback: cleaned up dynamic network: {self.dynamic_network_name}")
+                    except Exception as fallback_e:
+                        self.logger.warning(f"Failed to clean up dynamic network during fallback: {fallback_e}")
+        
         if self.interactive_session is not None:
             try:
                 self.interactive_session.session_process.terminate()
@@ -768,6 +809,23 @@ class SWEEnv(gym.Env):
                 self.logger.warning("Failed to terminate docker compose", exc_info=True)
             else:
                 self.logger.debug("Terminated docker compose")
+        
+        # Clean up dynamic network if it was created
+        if self.args.enable_dynamic_ports:
+            try:
+                # Use comprehensive cleanup to remove ALL dynamic networks
+                cleanup_dynamic_resources()
+                self.logger.debug("Performed comprehensive cleanup of dynamic CTF resources")
+            except Exception as e:
+                self.logger.warning(f"Failed to perform comprehensive cleanup: {e}")
+                # Fallback to single network cleanup if comprehensive cleanup fails
+                if self.dynamic_network_name:
+                    try:
+                        cleanup_dynamic_network(self.dynamic_network_name)
+                        self.logger.debug(f"Fallback: cleaned up dynamic network: {self.dynamic_network_name}")
+                    except Exception as fallback_e:
+                        self.logger.warning(f"Failed to clean up dynamic network during fallback: {fallback_e}")
+        
         self._init_container()
         self._init_scripts()
 
@@ -795,7 +853,13 @@ class SWEEnv(gym.Env):
         """
         assert self.container_name is not None
         if self.challenge is not None:
-            attach_network_interface_to_container(self.container_name)
+            # Set dynamic network name if dynamic ports are enabled and not already set
+            if self.args.enable_dynamic_ports and self.dynamic_network_name is None:
+                container_suffix = self.container_name.split('-')[-1]  # Get the hash part
+                self.dynamic_network_name = f"ctfnet-{container_suffix}"
+            
+            network_name = self.dynamic_network_name if self.dynamic_network_name else "ctfnet"
+            attach_network_interface_to_container(self.container_name, network_name)
 
     # ctf
     def _init_docker_compose(self) -> None:
@@ -803,8 +867,29 @@ class SWEEnv(gym.Env):
         Handles docker compose initialization for challenge with docker compose file.
         """
         if self.challenge is not None and self.challenge.get("docker_compose") is not None:
-            self.docker_compose = get_docker_compose(self.challenge["docker_compose"])
+            # Generate unique suffix for this instance to avoid conflicts
+            container_suffix = None
+            if self.args.enable_dynamic_ports:
+                assert self.container_name is not None
+                # Use container name as unique suffix
+                container_suffix = self.container_name.split('-')[-1]  # Get the hash part
+                self.dynamic_network_name = f"ctfnet-{container_suffix}"
+            
+            self.docker_compose, self.port_mappings = get_docker_compose(
+                self.challenge["docker_compose"],
+                container_name_suffix=container_suffix,
+                dynamic_ports=self.args.enable_dynamic_ports,
+                challenge_internal_port=self.challenge.get("port")
+            )
             self.logger.info("🌱 Initialized docker compose for challenge")
+            if self.port_mappings:
+                self.logger.info(f"🔌 Dynamic port mappings: {self.port_mappings}")
+                # Update challenge server description with port mapping info
+                # DO NOT overwrite the internal port - services still run on internal ports inside containers
+                from sweagent.environment.utils import InstanceBuilder
+                ib = InstanceBuilder()
+                ib.args = {"challenge": self.challenge}
+                ib.update_server_description_with_port_mapping(self.port_mappings)
 
     def _init_container(self, cached_image: str | None = None) -> None:
         """

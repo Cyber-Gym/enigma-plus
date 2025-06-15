@@ -28,9 +28,16 @@ class SummarizerConfig(FrozenSerializable):
     instance_template: str | None = None
 
     def __post_init__(self):
+        # Store the original function name before converting to object
+        object.__setattr__(self, "_original_function_name", self.function)
         object.__setattr__(self, "function", SummarizeFunction.get(self.function, self.window_length))  # type: ignore
         if isinstance(self.model, dict):
             object.__setattr__(self, "model", ModelArguments.from_dict(self.summarizer_model))  # type: ignore
+
+    @property
+    def function_name(self) -> str:
+        """Return the original function name as a string"""
+        return getattr(self, "_original_function_name", self.function.__class__.__name__ if hasattr(self.function, "__class__") else "Unknown")
 
 
 # ABSTRACT BASE CLASSES
@@ -62,6 +69,9 @@ class SummarizeFunction(metaclass=SummarizeFunctionMeta):
     def __init__(self, window_length: int):
         self._window_length = window_length
         self.logger = get_logger("summarizer")
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(window_length={self._window_length})"
 
     def setup(self, instance_args: dict[str, Any], config):
         """
@@ -228,6 +238,8 @@ class LMSummarizer(SummarizeFunction):
                     "agent": self.name,
                 }
             )
+            self.logger.debug(f"Summarizer history")
+            exit()
             response = model.query(history=self.history)
             stats = model.stats
             model.reset_stats(APIStats())
@@ -242,3 +254,21 @@ class LMSummarizer(SummarizeFunction):
                 f"Unhandled exception occurred when trying to summarize observation for input {input}: {traceback.format_exc()}"
             )
             return observation, APIStats()
+
+
+# Custom YAML representers for better serialization
+def summarize_function_representer(dumper, data):
+    """Custom YAML representer for SummarizeFunction objects"""
+    return dumper.represent_scalar('tag:yaml.org,2002:str', data.__class__.__name__)
+
+
+# Register the custom representers for all SummarizeFunction subclasses
+try:
+    import yaml
+    yaml.add_representer(SummarizeFunction, summarize_function_representer)
+    yaml.add_representer(SimpleSummarizer, summarize_function_representer)  
+    yaml.add_representer(Identity, summarize_function_representer)
+    yaml.add_representer(LMSummarizer, summarize_function_representer)
+except ImportError:
+    # yaml might not be available in all contexts
+    pass
