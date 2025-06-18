@@ -171,6 +171,12 @@ def create_dynamic_docker_compose(
             new_service_name = f"{service_name}-{container_name_suffix}"
             new_service_config = service_config.copy()
             
+            # Update container name if specified
+            if "container_name" in new_service_config:
+                original_container_name = new_service_config["container_name"]
+                new_service_config["container_name"] = f"{original_container_name}-{container_name_suffix}"
+                logger.debug(f"Updated container name from {original_container_name} to {new_service_config['container_name']}")
+            
             # Handle port mappings
             if "ports" in new_service_config:
                 new_ports = []
@@ -258,11 +264,13 @@ def create_dynamic_docker_compose(
                 new_networks[net_name] = net_config
         compose_data["networks"] = new_networks
     
-    # Create temporary file for modified compose
+    # Create temporary file for modified compose in the same directory as the original
+    original_dir = original_compose_path.parent
     temp_compose = tempfile.NamedTemporaryFile(
         mode='w', 
         suffix='.yml', 
         prefix=f'docker-compose-{container_name_suffix}-',
+        dir=original_dir,  # Create in the same directory as the original file
         delete=False
     )
     
@@ -1141,14 +1149,15 @@ def get_problem_statement_from_github_issue(owner: str, repo: str, issue_number:
 
 
 class InstanceBuilder:
-    def __init__(self, token: str | None = None):
+    def __init__(self, token: str | None = None, allow_dirty_repo: bool = False):
         """This helper class is used to build the data for an instance object,
         retrieving problem statements from github issues or local files and setting
         repo paths from github urls or local paths.
         """
         # Args that will be passed to the Instance constructor
-        self.args = {}
-        self.token = token
+        self.args: dict[str, Any] = {}
+        self._github_token = token
+        self._allow_dirty_repo = allow_dirty_repo
         self._instance_id_problem_suffix = ""
 
     def set_problem_statement_from_gh_issue(self, issue_url: str):
@@ -1157,7 +1166,7 @@ class InstanceBuilder:
             owner,
             repo,
             issue_number,
-            token=self.token,
+            token=self._github_token,
         )
         self.args["instance_id"] = f"{owner}__{repo}-i{issue_number}"
         self.args["problem_statement_source"] = "online"
@@ -1239,7 +1248,7 @@ class InstanceBuilder:
         self.args["repo"] = f"{owner}/{repo}"
         self.args["repo_type"] = "github"
         # Always get commit hash, because base_commit can also be branch or tag
-        api = GhApi(token=self.token)
+        api = GhApi(token=self._github_token)
         self.args["base_commit"] = get_commit(api, owner, repo, ref=base_commit).sha
         if base_commit != self.args["base_commit"]:
             logger.info(f"Base commit reference {base_commit} resolved to commit hash {self.args['base_commit']}")
@@ -1257,8 +1266,9 @@ class InstanceBuilder:
                 msg = f"Could not find git repository at {path=}."
                 raise ValueError(msg) from e
             if repo.is_dirty() and "PYTEST_CURRENT_TEST" not in os.environ:
-                msg = f"Local git repository {path} is dirty. Please commit or stash changes."
-                raise ValueError(msg)
+                if not self._allow_dirty_repo:
+                    msg = f"Local git repository {path} is dirty. Please commit or stash changes."
+                    raise ValueError(msg)
             self.args["base_commit"] = repo.head.object.hexsha
         self.args["version"] = self.args["base_commit"][:7]
 
@@ -1339,6 +1349,7 @@ def get_instances(
     token: str | None = None,
     *,
     repo_path: str = "",
+    allow_dirty_repo: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Getter function for handling json, jsonl files
@@ -1351,7 +1362,7 @@ def get_instances(
     """
 
     def instance_from_dict(instances):
-        ib = InstanceBuilder(token=token)
+        ib = InstanceBuilder(token=token, allow_dirty_repo=allow_dirty_repo)
         ib.set_from_dict(instances)
         return ib.build()
 
@@ -1370,7 +1381,7 @@ def get_instances(
         )
         or is_github_issue_url(file_path)
     ):
-        ib = InstanceBuilder(token=token)
+        ib = InstanceBuilder(token=token, allow_dirty_repo=allow_dirty_repo)
         ib.set_problem_statement(file_path)
         if repo_path:
             ib.set_repo_info(repo_path, base_commit=base_commit)

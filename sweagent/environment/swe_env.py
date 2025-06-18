@@ -116,6 +116,8 @@ class EnvironmentArguments(FrozenSerializable):
     container_mounts: list[str] = field(default_factory=list)
     # Enable dynamic port allocation for CTF challenges to support parallel execution
     enable_dynamic_ports: bool = False
+    # Allow working with dirty git repositories (skip the dirty check)
+    allow_dirty_repo: bool = False
 
     def __post_init__(self):
         if self.timeout is not None:
@@ -200,6 +202,7 @@ class SWEEnv(gym.Env):
             self.args.split,
             token=self._github_token,
             repo_path=self.args.repo_path,
+            allow_dirty_repo=self.args.allow_dirty_repo,
         )
         #: Instance we're currently processing. Gets set in self.reset.
         self.record: dict[str, Any] | None = None
@@ -714,12 +717,12 @@ class SWEEnv(gym.Env):
                 self.logger.debug("Terminated docker compose")
             
             # Clean up temporary docker-compose file if it was dynamically created
-            if self.args.enable_dynamic_ports and str(self.docker_compose).startswith('/tmp/docker-compose-'):
+            if self.args.enable_dynamic_ports and self.docker_compose.name.startswith('docker-compose-'):
                 try:
                     self.docker_compose.unlink()
-                    self.logger.debug(f"Cleaned up temporary docker-compose file: {self.docker_compose}")
+                    self.logger.debug(f"Cleaned up temporary docker-compose file during reset: {self.docker_compose}")
                 except Exception as e:
-                    self.logger.warning(f"Failed to clean up temporary docker-compose file: {e}")
+                    self.logger.warning(f"Failed to clean up temporary docker-compose file during reset: {e}")
         
         # Clean up dynamic network if it was created
         if self.args.enable_dynamic_ports:
@@ -809,6 +812,14 @@ class SWEEnv(gym.Env):
                 self.logger.warning("Failed to terminate docker compose", exc_info=True)
             else:
                 self.logger.debug("Terminated docker compose")
+            
+            # Clean up temporary docker-compose file if it was dynamically created
+            if self.args.enable_dynamic_ports and self.docker_compose.name.startswith('docker-compose-'):
+                try:
+                    self.docker_compose.unlink()
+                    self.logger.debug(f"Cleaned up temporary docker-compose file during reset: {self.docker_compose}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to clean up temporary docker-compose file during reset: {e}")
         
         # Clean up dynamic network if it was created
         if self.args.enable_dynamic_ports:
@@ -1194,8 +1205,19 @@ class SWEEnv(gym.Env):
             return f"flag{{{s}}}"
 
         if self.challenge is not None:
-            assert "flag" in self.challenge
-            solution = self.challenge["flag"]
+            if "flag" in self.challenge and self.challenge["flag"] != "pwn.college{...}":
+                solution = self.challenge["flag"]
+                return any(
+                    (
+                        submission == solution,
+                        wrap(submission) == solution,
+                        submission == wrap(solution),
+                    )
+                )
+        
+            elif "sha256_flag" in self.challenge:
+                checker = self.challenge["sha256_flag"]
+                return hashlib.sha256(submission.encode()).hexdigest() == checker
             return any(
                 (
                     submission == solution,
@@ -1203,7 +1225,6 @@ class SWEEnv(gym.Env):
                     submission == wrap(solution),
                 )
             )
-
         return True
 
     def get_submission(self, output: str) -> str | None:
