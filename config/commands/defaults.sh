@@ -1,6 +1,14 @@
 _print() {
     local total_lines=$(awk 'END {print NR}' "$CURRENT_FILE")
-    echo "[File: $(realpath "$CURRENT_FILE") ($total_lines lines total)]"
+    local file_path=$(realpath "$CURRENT_FILE")
+    
+    # Add indicator if this is a summarizer output file
+    if [[ "$file_path" == */output/* ]]; then
+        echo "[File: $file_path ($total_lines lines total)] ⚠️  SUMMARIZER OUTPUT FILE"
+    else
+        echo "[File: $file_path ($total_lines lines total)]"
+    fi
+    
     lines_above=$(jq -n "$CURRENT_LINE - $WINDOW/2" | jq '[0, .] | max | floor')
     lines_below=$(jq -n "$total_lines - $CURRENT_LINE - $WINDOW/2" | jq '[0, .] | max | round')
     if [ $lines_above -gt 0 ]; then
@@ -71,6 +79,16 @@ open() {
         export CURRENT_FILE=$(realpath "$1")
         export CURRENT_LINE=$line_number
         _constrain_line
+        
+        # Check if this is a summarizer output file and warn the user
+        if [[ "$CURRENT_FILE" == */output/* ]]; then
+            echo "⚠️  WARNING: You are now opening a summarizer output file."
+            echo "    Current file: $CURRENT_FILE"
+            echo "    Any EDIT commands will modify THIS file, not your original source file."
+            echo "    If you want to edit your original source file, use 'open <original_file_path>' first."
+            echo ""
+        fi
+        
         _print
     elif [ -d "$1" ]; then
         echo "Error: $1 is a directory. You can only open files. Use cd or ls to navigate directories."

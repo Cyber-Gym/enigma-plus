@@ -50,16 +50,17 @@ _print() {
     done < <(awk -v start="$start_line" -v end="$end_line" 'NR>=start && NR<=end {print}' "$CURRENT_FILE")
     local num_lines=${#lines[@]}
     if [ $start_line -gt 1 ]; then
-        echo "($((start_line - 1)) more lines above)"
+        lines_above=$(jq -n "$start_line - 1")
+        echo "($lines_above more lines above)"
     fi
-    for ((i=0; i<num_lines+1; i++)) do
-        local line_number=$((start_line + i))
+    for ((i = 0; i < $num_lines; i++)); do
+        line_number=$(jq -n "$start_line + $i")
         if [ $line_number -eq $START_CURSOR ]
         then
             echo $START_CURSOR_MARK
         fi
         # if i in [0, num_lines-1] then print the line number and the line
-        if [ $i -ge 0 ] && [ $i -lt $num_lines ]
+        if [ -n "$i" ] && [ -n "$num_lines" ] && [ "$i" -ge 0 ] && [ "$i" -lt "$num_lines" ]
         then
             echo "$line_number:${lines[i]}"
         fi

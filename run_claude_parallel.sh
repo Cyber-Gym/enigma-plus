@@ -7,7 +7,7 @@ DATASET_NAME=$1
 # CRITICAL FIX: Use absolute path for consistency
 SCRIPT_DIR="$(pwd)"
 DATASET_JSON="$(cd "$SCRIPT_DIR/../NYU_CTF_Bench" && pwd)/${DATASET_NAME}.json"
-MODEL_NAME="qwen3-agnet_8b_0705"
+MODEL_NAME="bedrock:us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 IMAGE_NAME="sweagent/enigma:latest"
 CONFIG_FILE="config/default_ctf.yaml"
 HOST_URL="http://localhost:8000"
@@ -34,7 +34,7 @@ DATASET_BASE_NAME=$(basename "$DATASET_JSON" .json)
 START_INDEX=$2
 END_INDEX=$3
 TRY_TIMES=$4
-PARALLEL_TASKS=15
+PARALLEL_TASKS=25
 DISABLE_CLEANUP=false
 
 # Set default values
@@ -96,7 +96,7 @@ if [ "$DISABLE_CLEANUP" = false ]; then
     echo "🔍 Step 1: Stopping and removing non-essential containers..."
     
     # Get all containers that are NOT based on lmsysorg/sglang (preserve the LLM server)
-    all_containers=$(docker ps -a --format "{{.ID}}\t{{.Image}}\t{{.Names}}" | grep -v "lmsysorg/sglang" | grep -v "CONTAIN\sID" || true)
+    all_containers=$(docker ps -a --format "{{.ID}}\t{{.Image}}\t{{.Names}}" | grep -v "lmsysorg/sglang" | grep -v "CONTAINER\sID" || true)
     
     if [ -n "$all_containers" ]; then
         echo "Found containers to remove (preserving lmsysorg/sglang):"
@@ -336,10 +336,10 @@ run_challenge() {
         
         echo 'Starting challenge: $challenge_id (try $try_num)' | tee -a '${LOG_PREFIX}.log'
         echo 'RUNNING' > '$STATUS_FILE'
-        
+
         # Run the main command and capture exit code
-        export OPENAI_API_KEY=\"$OPENAI_API_KEY\"
-        export OPENAI_API_BASE_URL=\"$OPENAI_API_BASE_URL\"
+        export OPENAI_API_KEY=\"\$OPENAI_API_KEY\"
+        export OPENAI_API_BASE_URL=\"\$OPENAI_API_BASE_URL\"
         python run.py \\
             --model_name '$MODEL_NAME' \\
             --ctf \\
@@ -352,9 +352,9 @@ run_challenge() {
             --trajectory_path \"trajectories/$DATASET_BASE_NAME/try${try_num}\" \\
             --temperature=0 \\
             --top_p=0.95 \\
-            --allow_dirty_repo \\
             --enable_dynamic_ports \\
             --container_name \"\$container_name\" \\
+            --allow_dirty_repo \\
             2>&1 | tee -a '${LOG_PREFIX}.log'
         
         exit_code=\$?
@@ -379,6 +379,53 @@ run_challenge() {
     echo "${session_name}:${STATUS_FILE}" >> "$ACTIVE_SESSIONS_FILE"
     
     return 0
+}
+
+# Function to wait for previous try of the same challenge to finish
+wait_for_previous_try() {
+    local challenge_id=$1
+    local try_num=$2
+    
+    # If this is try 1, no need to wait
+    if [ "$try_num" -eq 1 ]; then
+        return 0
+    fi
+    
+    local previous_try=$((try_num - 1))
+    
+    echo "⏳ [Challenge: $challenge_id] Waiting for try $previous_try to finish before starting try $try_num..."
+    
+    while true; do
+        # Look for any active sessions for this challenge with the previous try number
+        local previous_session_active=false
+        
+        if [ -f "$ACTIVE_SESSIONS_FILE" ]; then
+            while IFS=':' read -r session_name status_file; do
+                # Check if this session is for the same challenge and previous try
+                if echo "$session_name" | grep -q "${SESSION_PREFIX}_[0-9]*_${challenge_id}_try${previous_try}"; then
+                    if [ -f "$status_file" ]; then
+                        local status=$(cat "$status_file" 2>/dev/null)
+                        case "$status" in
+                            "RUNNING")
+                                previous_session_active=true
+                                break
+                                ;;
+                            "COMPLETED_SUCCESS"|"COMPLETED_FAILED"|"FINISHED")
+                                # Previous try is done
+                                ;;
+                        esac
+                    fi
+                fi
+            done < "$ACTIVE_SESSIONS_FILE"
+        fi
+        
+        if [ "$previous_session_active" = false ]; then
+            echo "✅ [Challenge: $challenge_id] Try $previous_try finished, starting try $try_num"
+            break
+        fi
+        
+        sleep 2
+    done
 }
 
 # Function to clean up resources for a specific completed task
@@ -443,6 +490,74 @@ cleanup_task_resources() {
     done
     
     echo "  ✅ Task-specific cleanup completed"
+}
+
+# Function to clean up finished sessions
+cleanup_finished_sessions() {
+    if [ ! -f "$ACTIVE_SESSIONS_FILE" ]; then
+        return
+    fi
+    
+    # Create temporary file for active sessions
+    local temp_file=$(mktemp)
+    
+    while IFS=':' read -r session_name status_file; do
+        if [ -z "$session_name" ] || [ -z "$status_file" ]; then
+            continue
+        fi
+        
+        # Check if session still exists
+        if ! session_exists "$session_name"; then
+            echo "🗑️  Session $session_name no longer exists, removing from tracking"
+            continue
+        fi
+        
+        # Check status file
+        if [ -f "$status_file" ]; then
+            local status=$(cat "$status_file" 2>/dev/null)
+            case "$status" in
+                "FINISHED"|"COMPLETED_SUCCESS"|"COMPLETED_FAILED")
+                    echo "🏁 Session $session_name finished with status: $status"
+                    
+                    # Extract task details from session name for cleanup
+                    # Session name format: swe_agent_${instance_id}_${challenge_id}_try${try_num}
+                    if [[ "$session_name" =~ ^${SESSION_PREFIX}_([0-9]+)_(.+)_try([0-9]+)$ ]]; then
+                        local instance_id="${BASH_REMATCH[1]}"
+                        local challenge_id="${BASH_REMATCH[2]}"
+                        local try_num="${BASH_REMATCH[3]}"
+                        
+                        echo "  📋 Extracted task details: instance_id=$instance_id, challenge_id=$challenge_id, try_num=$try_num"
+                        
+                        # Clean up task-specific Docker resources (backup cleanup)
+                        cleanup_task_resources "$challenge_id" "$try_num" "$instance_id"
+                    else
+                        echo "  ⚠️  Could not extract task details from session name: $session_name"
+                    fi
+                    
+                    # Kill the tmux session
+                    tmux kill-session -t "$session_name" 2>/dev/null
+                    ;;
+                "RUNNING")
+                    # Keep this session active
+                    echo "${session_name}:${status_file}" >> "$temp_file"
+                    ;;
+                *)
+                    # Unknown status, check if session is actually running
+                    if session_exists "$session_name"; then
+                        echo "${session_name}:${status_file}" >> "$temp_file"
+                    fi
+                    ;;
+            esac
+        else
+            # No status file, check if session exists
+            if session_exists "$session_name"; then
+                echo "${session_name}:${status_file}" >> "$temp_file"
+            fi
+        fi
+    done < "$ACTIVE_SESSIONS_FILE"
+    
+    # Replace active sessions file
+    mv "$temp_file" "$ACTIVE_SESSIONS_FILE"
 }
 
 # Function to clean up orphaned resources from this execution
@@ -548,74 +663,6 @@ wait_for_slot() {
         
         sleep 1
     done
-}
-
-# Function to clean up finished sessions
-cleanup_finished_sessions() {
-    if [ ! -f "$ACTIVE_SESSIONS_FILE" ]; then
-        return
-    fi
-    
-    # Create temporary file for active sessions
-    local temp_file=$(mktemp)
-    
-    while IFS=':' read -r session_name status_file; do
-        if [ -z "$session_name" ] || [ -z "$status_file" ]; then
-            continue
-        fi
-        
-        # Check if session still exists
-        if ! session_exists "$session_name"; then
-            echo "🗑️  Session $session_name no longer exists, removing from tracking"
-            continue
-        fi
-        
-        # Check status file
-        if [ -f "$status_file" ]; then
-            local status=$(cat "$status_file" 2>/dev/null)
-            case "$status" in
-                "FINISHED"|"COMPLETED_SUCCESS"|"COMPLETED_FAILED")
-                    echo "🏁 Session $session_name finished with status: $status"
-                    
-                    # Extract task details from session name for cleanup
-                    # Session name format: swe_agent_${instance_id}_${challenge_id}_try${try_num}
-                    if [[ "$session_name" =~ ^${SESSION_PREFIX}_([0-9]+)_(.+)_try([0-9]+)$ ]]; then
-                        local instance_id="${BASH_REMATCH[1]}"
-                        local challenge_id="${BASH_REMATCH[2]}"
-                        local try_num="${BASH_REMATCH[3]}"
-                        
-                        echo "  📋 Extracted task details: instance_id=$instance_id, challenge_id=$challenge_id, try_num=$try_num"
-                        
-                        # Clean up task-specific Docker resources (backup cleanup)
-                        cleanup_task_resources "$challenge_id" "$try_num" "$instance_id"
-                    else
-                        echo "  ⚠️  Could not extract task details from session name: $session_name"
-                    fi
-                    
-                    # Kill the tmux session
-                    tmux kill-session -t "$session_name" 2>/dev/null
-                    ;;
-                "RUNNING")
-                    # Keep this session active
-                    echo "${session_name}:${status_file}" >> "$temp_file"
-                    ;;
-                *)
-                    # Unknown status, check if session is actually running
-                    if session_exists "$session_name"; then
-                        echo "${session_name}:${status_file}" >> "$temp_file"
-                    fi
-                    ;;
-            esac
-        else
-            # No status file, check if session exists
-            if session_exists "$session_name"; then
-                echo "${session_name}:${status_file}" >> "$temp_file"
-            fi
-        fi
-    done < "$ACTIVE_SESSIONS_FILE"
-    
-    # Replace active sessions file
-    mv "$temp_file" "$ACTIVE_SESSIONS_FILE"
 }
 
 # Function to clean up all tmux sessions on exit

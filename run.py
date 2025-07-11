@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from sweagent import CONFIG_DIR
 from sweagent.utils.log import add_file_handler, get_logger
@@ -112,6 +113,10 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
     ctf: bool = False
     # Custom trajectory output path (if not provided, uses default: trajectories/{username}/{run_name})
     trajectory_path: str = ""
+    # Bypass step hit from previous history and remove trajectory to overwrite (unless flag was captured)
+    bypass_step_limit_history: bool = False
+    # Start container only without running agents (for debugging/manual interaction)
+    container_only: bool = False
 
     @property
     def run_name(self) -> str:
@@ -444,6 +449,63 @@ class Main:
     def main(self):
         for hook in self.hooks:
             hook.on_start()
+        
+        # Handle container-only mode
+        if self.args.container_only:
+            logger.info("🚀 Starting container-only mode...")
+            try:
+                # Initialize the first instance to set up the container
+                index = 0
+                logger.info(f"📋 Loading instance {index} for container setup...")
+                observation, info = self.env.reset(index)
+                
+                if info and "exit_status" in info:
+                    logger.error(f"❌ Failed to initialize environment: {info}")
+                    return
+                
+                logger.info("✅ Container started successfully!")
+                logger.info(f"🐳 Container name: {self.env.container_name}")
+                logger.info(f"🏗️  Image: {self.env.image_name}")
+                
+                if self.env.record:
+                    logger.info(f"📁 Repository: {self.env.record.get('repo', 'N/A')}")
+                    logger.info(f"🔗 Base commit: {self.env.record.get('base_commit', 'N/A')}")
+                
+                print("\n" + "=" * 70)
+                print("🎯 CONTAINER-ONLY MODE: Container ready for manual interaction!")
+                print("=" * 70)
+                print(f"Container name: {self.env.container_name}")
+                print(f"Repository path: /{self.env._repo_name}")
+                print("\nTo interact manually, run:")
+                print(f"  docker exec -it {self.env.container_name} /bin/bash")
+                print("\nTo run commands via the environment object:")
+                print("  # In Python console:")
+                print("  from sweagent.environment.swe_env import SWEEnv")
+                print(f"  # Connect to existing container: {self.env.container_name}")
+                print("\nPress Ctrl+C to stop and clean up the container.")
+                print("=" * 70)
+                
+                # Keep the container alive
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("\n🛑 Received interrupt signal, cleaning up...")
+                    
+            except KeyboardInterrupt:
+                logger.info("\n🛑 Interrupted by user")
+            except Exception as e:
+                logger.error(f"❌ Error in container-only mode: {e}")
+                raise
+            finally:
+                logger.info("🧹 Cleaning up container...")
+                self.env.close()
+                logger.info("✅ Container cleaned up")
+                for hook in self.hooks:
+                    hook.on_end()
+            return
+        
+        # Normal mode: run agents on instances
         for index in range(len(self.env.data)):
             try:
                 self.run(index)
@@ -516,6 +578,23 @@ class Main:
         # If the trajectory has no exit status, it's incomplete and we will redo it
         exit_status = data["info"].get("exit_status", None)
         n_calls = data["info"].get("summarizer", {}).get("n_calls", 0)
+        
+        # Handle bypass_step_limit_history flag
+        if self.args.bypass_step_limit_history:
+            # Check if previous run hit step limit
+            step_limit_hit = exit_status and exit_status.startswith("step_") and exit_status.endswith("_hit")
+            
+            # If flag was captured (successful completion), still skip
+            if exit_status == "submitted":
+                logger.info(f"⏭️ Skipping existing trajectory - flag was captured: {log_path}")
+                return True
+            
+            # If step limit was hit, remove trajectory to start fresh
+            if step_limit_hit:
+                logger.info(f"🔄 Bypassing step limit history, removing trajectory: {log_path}")
+                log_path.unlink()
+                return False
+        
         if (exit_status == "early_exit" or exit_status is None) and n_calls < self.args.agent.model.per_instance_step_limit:
             logger.warning(f"Found existing trajectory with no exit status: {log_path}. Removing.")
             log_path.unlink()
@@ -564,6 +643,8 @@ def get_args(args=None) -> ScriptArguments:
             verbose=True,
             install_environment=True,
             cache_task_images=False,
+            enable_network_restrictions=False,
+            enable_dynamic_ports=True,
         ),
         skip_existing=True,
         agent=AgentArguments(
@@ -581,6 +662,8 @@ def get_args(args=None) -> ScriptArguments:
         actions=ActionsArguments(open_pr=False, skip_if_commits_reference_issue=True),
         ctf=False,
         trajectory_path="",
+        bypass_step_limit_history=False,
+        container_only=False,
     )
 
     # Nicer yaml dumping of multiline strings

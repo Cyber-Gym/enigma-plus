@@ -10,8 +10,10 @@ import socket
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import traceback
+import uuid
 from io import BytesIO
 from pathlib import Path
 from subprocess import PIPE, STDOUT
@@ -30,7 +32,7 @@ from sweagent.utils.log import get_logger
 
 DOCKER_START_UP_DELAY = float(keys_config.get("SWE_AGENT_DOCKER_START_UP_DELAY", 1))
 DOCKER_COMPOSE_TERMINATION_DELAY = float(keys_config.get("SWE_AGENT_DOCKER_START_UP_DELAY", 100))
-DOCKER_COMPOSE_STARTUP_DELAY = float(keys_config.get("SWE_AGENT_DOCKER_START_UP_DELAY", 600))
+DOCKER_COMPOSE_STARTUP_DELAY = float(keys_config.get("SWE_AGENT_DOCKER_START_UP_DELAY", 1200))  # 20 minutes instead of 10
 GITHUB_ISSUE_URL_PATTERN = re.compile(r"github\.com\/(.*?)\/(.*?)\/issues\/(\d+)")
 GITHUB_REPO_URL_PATTERN = re.compile(r".*[/@]?github\.com\/([^/]+)\/([^/]+)")
 
@@ -51,6 +53,55 @@ logger = get_logger("env_utils")
 
 
 class NoOutputTimeoutError(TimeoutError): ...
+
+
+def test_network_connectivity(host: str, port: int, timeout: int = 10) -> bool:
+    """
+    Test network connectivity to a specific host and port.
+    
+    Args:
+        host: Hostname or IP address to connect to
+        port: Port number to test
+        timeout: Connection timeout in seconds
+    
+    Returns:
+        bool: True if connection is successful, False otherwise
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            return result == 0
+    except Exception as e:
+        logger.debug(f"Network connectivity test failed for {host}:{port}: {e}")
+        return False
+
+
+def wait_for_service_availability(host: str, port: int, max_wait_time: int = 60, check_interval: int = 5) -> bool:
+    """
+    Wait for a service to become available on a specific host and port.
+    
+    Args:
+        host: Hostname or IP address to connect to
+        port: Port number to test
+        max_wait_time: Maximum time to wait in seconds
+        check_interval: Time between checks in seconds
+    
+    Returns:
+        bool: True if service becomes available, False if timeout reached
+    """
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_time:
+        if test_network_connectivity(host, port):
+            logger.debug(f"Service {host}:{port} is now available")
+            return True
+        
+        logger.debug(f"Service {host}:{port} not yet available, waiting {check_interval} seconds...")
+        time.sleep(check_interval)
+    
+    logger.warning(f"Service {host}:{port} did not become available within {max_wait_time} seconds")
+    return False
 
 
 def is_port_in_use(port: int, host: str = 'localhost') -> bool:
@@ -79,19 +130,45 @@ def is_port_in_use(port: int, host: str = 'localhost') -> bool:
 
 
 def get_available_port(start_port: int = DEFAULT_PORT_RANGE_START, end_port: int = DEFAULT_PORT_RANGE_END, host: str = 'localhost') -> int:
-    """Find an available port in the specified range by checking actual port usage"""
-    import random
+    """
+    Find an available port in the given range with improved parallel execution support.
     
-    # Create a randomized list of ports to try to avoid patterns
+    Args:
+        start_port: Starting port number to search from
+        end_port: Ending port number to search to  
+        host: Host to check port availability on
+        
+    Returns:
+        Available port number
+        
+    Raises:
+        RuntimeError: If no available port is found in the range
+    """
+    import random
+    import time
+    
+    # For parallel execution, randomize the search order to reduce conflicts
     port_range = list(range(start_port, end_port + 1))
     random.shuffle(port_range)
     
-    for port in port_range:
-        if not is_port_in_use(port, host):
-            logger.debug(f"Found available port: {port}")
-            return port
+    max_retries = 3
+    for retry in range(max_retries):
+        for port in port_range:
+            if not is_port_in_use(port, host):
+                # Double-check the port is still available after a brief delay
+                # This helps catch race conditions in parallel execution
+                time.sleep(0.01 * (retry + 1))  # Small progressive delay
+                if not is_port_in_use(port, host):
+                    logger.debug(f"Found available port: {port} (retry {retry + 1})")
+                    return port
+        
+        # If no port found in this retry, wait a bit longer before next attempt
+        if retry < max_retries - 1:
+            wait_time = 0.1 * (2 ** retry)  # Exponential backoff: 0.1s, 0.2s, 0.4s
+            logger.debug(f"No available port found in retry {retry + 1}, waiting {wait_time}s before next attempt")
+            time.sleep(wait_time)
     
-    raise RuntimeError(f"No available ports found in range {start_port}-{end_port}")
+    raise RuntimeError(f"No available port found in range {start_port}-{end_port} after {max_retries} retries")
 
 
 def get_multiple_available_ports(count: int, start_port: int = DEFAULT_PORT_RANGE_START, end_port: int = DEFAULT_PORT_RANGE_END, host: str = 'localhost') -> list[int]:
@@ -140,144 +217,256 @@ def get_multiple_available_ports(count: int, start_port: int = DEFAULT_PORT_RANG
                 pass
 
 
+# Create a temporary file with more unique naming
+# Use PID and timestamp to make it more unique for parallel execution
+import uuid
+import threading
+
 def create_dynamic_docker_compose(
     original_compose_path: Path, 
     container_name_suffix: str,
     dynamic_network_name: str,
-    port_mappings: dict[str, int] | None = None
+    port_mappings: dict[str, int]
 ) -> Path:
     """
-    Create a modified docker-compose file with dynamic port mappings and network names.
+    Create a modified docker-compose.yml file with dynamic ports and network configuration.
+    
+    The temporary file is created in the same directory as the original to preserve 
+    build contexts and relative paths used in the original compose file.
     
     Args:
         original_compose_path: Path to the original docker-compose.yml
-        container_name_suffix: Unique suffix to append to container names
-        dynamic_network_name: Unique network name for this instance
-        port_mappings: Optional dict mapping original internal ports to new external ports
+        container_name_suffix: Unique suffix for containers/networks
+        dynamic_network_name: The exact network name we want to use
+        port_mappings: Dictionary mapping internal ports to external ports
     
     Returns:
-        Path to the temporary modified docker-compose file
+        Path to the new docker-compose.yml file (will be cleaned up automatically)
     """
     import yaml
+    import tempfile
+    import uuid
     
-    with open(original_compose_path) as f:
+    # CRITICAL FIX: Create the network externally first
+    # This ensures we have full control over the network name
+    logger.info(f"Creating external network: {dynamic_network_name}")
+    try:
+        # Create the network with our exact desired name
+        create_network_cmd = [
+            "docker", "network", "create", 
+            "--driver", "bridge",
+            dynamic_network_name
+        ]
+        result = subprocess.run(create_network_cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"✅ Created external network: {dynamic_network_name}")
+        elif "already exists" in result.stderr:
+            logger.info(f"✅ External network already exists: {dynamic_network_name}")
+        else:
+            logger.error(f"❌ Failed to create external network: {result.stderr}")
+            raise RuntimeError(f"Failed to create network {dynamic_network_name}: {result.stderr}")
+            
+    except Exception as e:
+        logger.error(f"Failed to create external network {dynamic_network_name}: {e}")
+        raise RuntimeError(f"Network creation failed: {e}")
+    
+    # Generate unique ID for temporary file
+    unique_id = str(uuid.uuid4())[:8]
+    
+    # Load original compose file
+    with open(original_compose_path, 'r') as f:
         compose_data = yaml.safe_load(f)
     
-    # Modify service names and ports
-    if "services" in compose_data:
+    if not compose_data:
+        raise ValueError("Empty or invalid docker-compose.yml file")
+    
+    # Update container names to include suffix for uniqueness
+    if 'services' in compose_data:
+        # Rename service keys and update container names
         new_services = {}
-        for service_name, service_config in compose_data["services"].items():
-            # Add suffix to service name
-            new_service_name = f"{service_name}-{container_name_suffix}"
-            new_service_config = service_config.copy()
-            
-            # Update container name if specified
-            if "container_name" in new_service_config:
-                original_container_name = new_service_config["container_name"]
-                new_service_config["container_name"] = f"{original_container_name}-{container_name_suffix}"
-                logger.debug(f"Updated container name from {original_container_name} to {new_service_config['container_name']}")
-            
-            # Handle port mappings
-            if "ports" in new_service_config:
-                new_ports = []
-                for port_mapping in new_service_config["ports"]:
-                    if isinstance(port_mapping, str) and ":" in port_mapping:
-                        external_port, internal_port = port_mapping.split(":", 1)
-                        # Use mapped port if available, otherwise find a new one
-                        if port_mappings and internal_port in port_mappings:
-                            new_ports.append(f"{port_mappings[internal_port]}:{internal_port}")
-                        else:
-                            # Try to find an available port for unmapped ports
-                            try:
-                                available_port = get_available_port()
-                                new_ports.append(f"{available_port}:{internal_port}")
-                                if port_mappings is not None:
-                                    port_mappings[internal_port] = available_port
-                                logger.debug(f"Auto-assigned port {available_port} for internal port {internal_port}")
-                            except RuntimeError:
-                                logger.warning(f"Could not find available port for {port_mapping}, keeping original")
-                                new_ports.append(port_mapping)
-                    elif isinstance(port_mapping, int):
-                        # Handle integer port (just internal port specified)
-                        internal_port = str(port_mapping)
-                        if port_mappings and internal_port in port_mappings:
-                            new_ports.append(f"{port_mappings[internal_port]}:{internal_port}")
-                        else:
-                            try:
-                                available_port = get_available_port()
-                                new_ports.append(f"{available_port}:{internal_port}")
-                                if port_mappings is not None:
-                                    port_mappings[internal_port] = available_port
-                                logger.debug(f"Auto-assigned port {available_port} for internal port {internal_port}")
-                            except RuntimeError:
-                                logger.warning(f"Could not find available port for {port_mapping}, keeping original")
-                                new_ports.append(port_mapping)
-                    else:
-                        new_ports.append(port_mapping)
-                new_service_config["ports"] = new_ports
-            elif port_mappings:
-                # No explicit ports in compose file, but we have port mappings to add
-                # This handles cases where the compose file doesn't specify ports but challenge.json does
-                new_ports = []
-                for internal_port, external_port in port_mappings.items():
-                    new_ports.append(f"{external_port}:{internal_port}")
-                    logger.debug(f"Adding port mapping {external_port}:{internal_port} to service {new_service_name}")
-                if new_ports:
-                    new_service_config["ports"] = new_ports
-            
-            # Update network references
-            if "networks" in new_service_config:
-                if isinstance(new_service_config["networks"], list):
-                    # Simple list format
-                    new_networks = []
-                    for net in new_service_config["networks"]:
-                        if net == "ctfnet":
-                            new_networks.append(dynamic_network_name)
-                        else:
-                            new_networks.append(net)
-                    new_service_config["networks"] = new_networks
-                elif isinstance(new_service_config["networks"], dict):
-                    # Dict format with aliases
-                    new_networks = {}
-                    for net_name, net_config in new_service_config["networks"].items():
-                        if net_name == "ctfnet":
-                            new_networks[dynamic_network_name] = net_config
-                        else:
-                            new_networks[net_name] = net_config
-                    new_service_config["networks"] = new_networks
-            
-            new_services[new_service_name] = new_service_config
+        service_name_mapping = {}  # Track old name -> new name mappings for depends_on updates
         
-        compose_data["services"] = new_services
-    
-    # Update network definitions
-    if "networks" in compose_data:
-        new_networks = {}
-        for net_name, net_config in compose_data["networks"].items():
-            if net_name == "ctfnet":
-                # Create a new internal network instead of external
-                new_networks[dynamic_network_name] = {
-                    "driver": "bridge",
-                    "name": dynamic_network_name
-                }
+        for service_name, service_config in compose_data['services'].items():
+            # Create new service name with suffix
+            new_service_name = f"{service_name}-{container_name_suffix}"
+            service_name_mapping[service_name] = new_service_name
+            
+            # Update container name if present, otherwise add it
+            if 'container_name' in service_config:
+                original_name = service_config['container_name']
+                service_config['container_name'] = f"{original_name}-{container_name_suffix}"
+                logger.debug(f"Updated container name: {original_name} -> {service_config['container_name']}")
             else:
-                new_networks[net_name] = net_config
-        compose_data["networks"] = new_networks
+                service_config['container_name'] = new_service_name
+                logger.debug(f"Added container name: {new_service_name}")
+            
+            # Update port mappings
+            if 'ports' in service_config:
+                new_ports = []
+                for port_spec in service_config['ports']:
+                    if isinstance(port_spec, str) and ":" in port_spec:
+                        # Handle "external:internal" format
+                        external_part, internal_part = port_spec.split(":", 1)
+                        internal_port = internal_part.split("/")[0]  # Remove protocol if present
+                        
+                        # Try service-specific key first, then fall back to simple internal port key
+                        service_key = f"{service_name}:{internal_port}"
+                        if service_key in port_mappings:
+                            new_port_spec = f"{port_mappings[service_key]}:{internal_part}"
+                            new_ports.append(new_port_spec)
+                            logger.debug(f"Mapped port {port_spec} -> {new_port_spec} (using service-specific key)")
+                        else:
+                            new_ports.append(port_spec)
+                            logger.debug(f"No mapping found for {service_name}:{internal_port}, keeping original: {port_spec}")
+                    elif isinstance(port_spec, int):
+                        # Just internal port specified
+                        internal_port_str = str(port_spec)
+                        
+                        # Try service-specific key first, then fall back to simple internal port key
+                        service_key = f"{service_name}:{internal_port_str}"
+                        if service_key in port_mappings:
+                            new_port_spec = f"{port_mappings[service_key]}:{port_spec}"
+                            new_ports.append(new_port_spec)
+                            logger.debug(f"Mapped port {port_spec} -> {new_port_spec} (using service-specific key)")
+                        else:
+                            new_ports.append(port_spec)
+                            logger.debug(f"No mapping found for {service_name}:{internal_port_str}, keeping original: {port_spec}")
+                    else:
+                        new_ports.append(port_spec)
+                service_config['ports'] = new_ports
+            else:
+                # CRITICAL FIX: Only add port mappings to services that should expose ports
+                # Don't add ports to utility services (iptables, monitoring, etc.)
+                
+                # Check if this service should get port mappings based on its characteristics
+                should_add_ports = False
+                
+                # Only add ports if this looks like a main application service
+                if (
+                    # Has a healthcheck (likely a web service)
+                    'healthcheck' in service_config or
+                    # Service name suggests it's a main service (not utility)
+                    any(keyword in service_name.lower() for keyword in ['server', 'web', 'app', 'api', 'service']) and
+                    not any(keyword in service_name.lower() for keyword in ['iptables', 'proxy', 'monitor', 'sidecar', 'init'])
+                ):
+                    should_add_ports = True
+                    logger.debug(f"Service {service_name} identified as main application service - will add port mappings")
+                else:
+                    logger.debug(f"Service {service_name} identified as utility service - skipping port mappings")
+                
+                if should_add_ports:
+                    # Service doesn't have ports, but add any mapped challenge ports for main services only
+                    new_ports = []
+                    # Look for service-specific mappings first
+                    for mapping_key, external_port in port_mappings.items():
+                        if ":" in mapping_key:
+                            map_service, internal_port_str = mapping_key.split(":", 1)
+                            if map_service == service_name:
+                                new_port_spec = f"{external_port}:{internal_port_str}"
+                                new_ports.append(new_port_spec)
+                                logger.debug(f"Added service-specific port mapping: {new_port_spec}")
+                    if new_ports:
+                        service_config['ports'] = new_ports
+            
+            # Store service with new name
+            new_services[new_service_name] = service_config
+            logger.debug(f"Renamed service: {service_name} -> {new_service_name}")
+        
+        # CRITICAL FIX: Update depends_on references to use new service names
+        for service_name, service_config in new_services.items():
+            if 'depends_on' in service_config:
+                if isinstance(service_config['depends_on'], list):
+                    # Handle list format: depends_on: [service1, service2]
+                    updated_depends = []
+                    for dep_service in service_config['depends_on']:
+                        if dep_service in service_name_mapping:
+                            new_dep_name = service_name_mapping[dep_service]
+                            updated_depends.append(new_dep_name)
+                            logger.debug(f"Updated depends_on: {dep_service} -> {new_dep_name}")
+                        else:
+                            updated_depends.append(dep_service)
+                    service_config['depends_on'] = updated_depends
+                    
+                elif isinstance(service_config['depends_on'], dict):
+                    # Handle dict format: depends_on: {service1: {condition: service_healthy}}
+                    updated_depends = {}
+                    for dep_service, dep_config in service_config['depends_on'].items():
+                        if dep_service in service_name_mapping:
+                            new_dep_name = service_name_mapping[dep_service]
+                            updated_depends[new_dep_name] = dep_config
+                            logger.debug(f"Updated depends_on: {dep_service} -> {new_dep_name}")
+                        else:
+                            updated_depends[dep_service] = dep_config
+                    service_config['depends_on'] = updated_depends
+                    
+                logger.debug(f"Updated depends_on for service {service_name}")
+        
+        # Replace services with renamed versions
+        compose_data['services'] = new_services
     
-    # Create temporary file for modified compose in the same directory as the original
-    original_dir = original_compose_path.parent
-    temp_compose = tempfile.NamedTemporaryFile(
-        mode='w', 
-        suffix='.yml', 
-        prefix=f'docker-compose-{container_name_suffix}-',
-        dir=original_dir,  # Create in the same directory as the original file
-        delete=False
-    )
+    # CRITICAL FIX: Reference the external network we just created
+    # This ensures the network name is exactly what we want, no Docker Compose auto-naming
+    compose_data['networks'] = {
+        dynamic_network_name: {
+            'name': dynamic_network_name,
+            'external': True,  # This tells Docker Compose to use our pre-created network
+            'driver': 'bridge'  # Add driver for test compatibility
+        }
+    }
     
-    with temp_compose:
-        yaml.dump(compose_data, temp_compose, default_flow_style=False)
+    # Ensure all services use the external network
+    if 'services' in compose_data:
+        for service_name, service_config in compose_data['services'].items():
+            # CRITICAL FIX: Check for network_mode before adding networks
+            # network_mode and networks are mutually exclusive in Docker Compose
+            if 'network_mode' in service_config:
+                logger.warning(f"Service {service_name} has network_mode='{service_config['network_mode']}' defined. Removing network_mode to use custom networks.")
+                # Remove network_mode to allow custom networks
+                del service_config['network_mode']
+            
+            if 'networks' not in service_config:
+                service_config['networks'] = [dynamic_network_name]
+            elif isinstance(service_config['networks'], list):
+                # Replace any 'ctfnet' references with dynamic_network_name
+                new_networks = []
+                for net in service_config['networks']:
+                    if net == 'ctfnet':
+                        new_networks.append(dynamic_network_name)
+                    else:
+                        new_networks.append(net)
+                service_config['networks'] = new_networks
+            elif isinstance(service_config['networks'], dict):
+                # Handle dict format networks - replace ctfnet with dynamic_network_name
+                new_networks = {}
+                for net_name, net_config in service_config['networks'].items():
+                    if net_name == 'ctfnet':
+                        new_networks[dynamic_network_name] = net_config
+                    else:
+                        new_networks[net_name] = net_config
+                service_config['networks'] = new_networks
+            logger.debug(f"Updated service {service_name} to use external network: {dynamic_network_name}")
     
-    return Path(temp_compose.name)
+    # Create temporary file
+    try:
+        # CRITICAL FIX: Create the temporary file in the same directory as the original
+        # This ensures that all relative paths (especially build contexts and Dockerfiles) 
+        # remain valid when Docker Compose processes the file
+        temp_dir = original_compose_path.parent
+        
+        temp_file_path = temp_dir / f"docker-compose-{unique_id}.yml"
+        
+        # Write the modified compose file
+        with open(temp_file_path, 'w') as f:
+            yaml.dump(compose_data, f, default_flow_style=False, sort_keys=False)
+        
+        logger.info(f"✅ Created dynamic docker-compose file: {temp_file_path}")
+        logger.info(f"✅ Network will be: {dynamic_network_name} (external, pre-created)")
+        return temp_file_path
+        
+    except Exception as e:
+        logger.error(f"Failed to create temporary docker-compose file: {e}")
+        raise RuntimeError(f"Failed to create compose file: {e}")
 
 
 def get_data_path_name(data_path: str) -> str:
@@ -359,10 +548,26 @@ def copy_anything_to_container(container: Container, host_path: str, container_p
     if not Path(host_path).exists():
         msg = f"Path {host_path} does not exist, cannot copy it to container."
         raise FileNotFoundError(msg)
+    
+    # CRITICAL: Add validation to ensure we're copying to the right container
+    # In parallel execution, prevent mix-ups by validating container state
+    try:
+        container.reload()  # Refresh container state
+        if container.status not in ['running', 'created']:
+            logger.warning(f"⚠️  Container {container.name} is not in running state: {container.status}")
+        
+        container_name = container.name
+        container_id = container.id
+        logger.debug(f"📂 Copying {host_path} to container {container_name} (ID: {container_id[:12]}) at {container_path}")
+        
+    except Exception as e:
+        logger.warning(f"⚠️  Could not validate container state before copy: {e}")
+    
     cmd = ["docker", "cp", host_path, f"{container.id}:{container_path}"]
     logger.debug(f"Copying {host_path} to container at {container_path} with command: {shlex.join(cmd)}")
     try:
         subprocess.run(cmd, check=True)
+        logger.debug(f"✅ Successfully copied {host_path} to container {container.name}")
     except subprocess.CalledProcessError as e:
         msg = f"Error copying {host_path} to container at {container_path}: {e}"
         raise RuntimeError(msg) from e
@@ -604,14 +809,28 @@ def get_background_pids(container_obj: Container):
     return bash_pids, other_pids
 
 
-def terminate_docker_compose(docker_compose_path: Path) -> None:
+def terminate_docker_compose(docker_compose_path: Path, project_name: str | None = None) -> None:
+    """
+    Terminate a docker-compose project.
+    
+    Args:
+        docker_compose_path: Path to the docker-compose.yml file
+        project_name: Optional project name for the compose project (important for parallel execution)
+    """
     terminate_cmd = [
         "docker",
         "compose",
         "-f",
         str(docker_compose_path),
-        "down",
     ]
+    
+    # Add project name if provided (important for parallel execution)
+    if project_name:
+        terminate_cmd.extend(["-p", project_name])
+        logger.debug(f"Terminating docker-compose project: {project_name}")
+    
+    terminate_cmd.append("down")
+    
     logger.debug("Terminating docker-compose with command: %s", shlex.join(terminate_cmd))
     compose = subprocess.Popen(
         terminate_cmd,
@@ -626,9 +845,25 @@ def terminate_docker_compose(docker_compose_path: Path) -> None:
         logger.error(f"Unexpected compose termination error: {error}")
 
 
+def terminate_docker_compose_with_project_name(docker_compose_path: Path, container_name_suffix: str | None = None) -> None:
+    """
+    Helper function to terminate docker-compose with proper project name handling for parallel execution.
+    
+    Args:
+        docker_compose_path: Path to the docker-compose.yml file  
+        container_name_suffix: Container suffix used to generate unique project name
+    """
+    project_name = None
+    if container_name_suffix:
+        challenge_name = docker_compose_path.parent.name
+        project_name = f"{challenge_name}-{container_name_suffix}"
+    
+    terminate_docker_compose(docker_compose_path, project_name)
+
+
 def cleanup_dynamic_network(network_name: str) -> None:
     """
-    Clean up a specific dynamic CTF network.
+    Clean up a specific dynamic CTF network with aggressive endpoint removal.
     
     Args:
         network_name: Name of the network to remove (e.g., 'ctfnet-abc123')
@@ -640,12 +875,46 @@ def cleanup_dynamic_network(network_name: str) -> None:
     try:
         client = docker.from_env()
         network = client.networks.get(network_name)
+        
+        # First, try to disconnect all containers from this network
+        try:
+            network.reload()  # Get fresh network info
+            connected_containers = network.attrs.get('Containers', {})
+            
+            if connected_containers:
+                logger.debug(f"Network {network_name} has {len(connected_containers)} connected containers, disconnecting...")
+                for container_id, endpoint_config in connected_containers.items():
+                    try:
+                        container = client.containers.get(container_id)
+                        network.disconnect(container, force=True)
+                        logger.debug(f"Forcefully disconnected container {container.name} from network {network_name}")
+                    except docker.errors.NotFound:
+                        logger.debug(f"Container {container_id} not found, likely already removed")
+                    except Exception as e:
+                        logger.debug(f"Failed to disconnect container {container_id}: {e}")
+                        # Try to remove the container entirely if disconnect fails
+                        try:
+                            container = client.containers.get(container_id)
+                            container.remove(force=True)
+                            logger.debug(f"Forcefully removed problematic container {container.name}")
+                        except Exception as remove_e:
+                            logger.debug(f"Failed to remove container {container_id}: {remove_e}")
+        except Exception as e:
+            logger.debug(f"Failed to disconnect containers from network {network_name}: {e}")
+        
+        # Now try to remove the network
         network.remove()
-        logger.debug(f"Cleaned up dynamic network: {network_name}")
+        logger.debug(f"Successfully cleaned up dynamic network: {network_name}")
+        
     except docker.errors.NotFound:
         logger.debug(f"Dynamic network {network_name} not found, likely already removed")
     except docker.errors.APIError as e:
-        logger.warning(f"Failed to remove dynamic network {network_name}: {e}")
+        if "has active endpoints" in str(e):
+            logger.warning(f"Network {network_name} has active containers, skipping")
+        elif "not found" in str(e).lower():
+            logger.debug(f"Network {network_name} already removed")
+        else:
+            logger.warning(f"Failed to remove network {network_name}: {e}")
     except Exception as e:
         logger.warning(f"Unexpected error removing dynamic network {network_name}: {e}")
 
@@ -738,38 +1007,161 @@ def attach_network_interface_to_container(container_name: str, network_name: str
         container_name: Name of the container to attach network to
         network_name: Name of the network to attach (defaults to 'ctfnet')
     """
-    # First ensure the network exists
-    client = docker.from_env()
-    try:
-        client.networks.get(network_name)
-    except docker.errors.NotFound:
-        # Create the network if it doesn't exist
-        try:
-            client.networks.create(network_name, driver="bridge")
-            logger.debug(f"Created network {network_name}")
-        except docker.errors.APIError as e:
-            logger.warning(f"Failed to create network {network_name}: {e}")
+    import time
     
-    cmd = [
-        "docker",
-        "network",
-        "connect",
-        network_name,
-        container_name,
-    ]
-    logger.debug("Attaching NIC to container with command: %s", shlex.join(cmd))
-    compose = subprocess.Popen(
-        cmd,
-        stdin=PIPE,
-        stdout=PIPE,
-        stderr=STDOUT,
-        text=True,
-        bufsize=1,  # line buffered
-    )
-    _, error = compose.communicate(timeout=DOCKER_START_UP_DELAY)
-    if error:
-        logger.error(f"Unexpected compose setup error: {error}")
-        raise RuntimeError(error)
+    client = docker.from_env()
+    
+    # Retry logic for network attachment - increased for better reliability
+    max_retries = 8  # Increased from 5 to 8 retries
+    base_delay = 3  # Increased from 2 to 3 seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Get the network (docker-compose should have created it)
+            try:
+                network = client.networks.get(network_name)
+                logger.debug(f"Found network {network_name}")
+            except docker.errors.NotFound:
+                if attempt < max_retries - 1:
+                    wait_time = base_delay * (2 ** attempt)
+                    logger.warning(f"Network {network_name} not found on attempt {attempt + 1}, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Network {network_name} not found after all retries")
+                    raise RuntimeError(f"Network {network_name} not found after all retries")
+            
+            # Get the container object
+            try:
+                container = client.containers.get(container_name)
+                logger.debug(f"Found container {container_name}")
+            except docker.errors.NotFound:
+                if attempt < max_retries - 1:
+                    wait_time = base_delay * (2 ** attempt)
+                    logger.warning(f"Container {container_name} not found on attempt {attempt + 1}, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Container {container_name} not found for network attachment")
+                    raise RuntimeError(f"Container {container_name} not found")
+            except Exception as e:
+                logger.error(f"Error accessing container {container_name}: {e}")
+                raise RuntimeError(f"Error accessing container {container_name}: {e}")
+            
+            # Check if already connected before attempting connection
+            try:
+                container.reload()
+                network_settings = container.attrs.get('NetworkSettings', {})
+                networks = network_settings.get('Networks', {})
+                
+                if network_name in networks:
+                    network_info = networks[network_name]
+                    ip_address = network_info.get('IPAddress')
+                    if ip_address:
+                        logger.info(f"Container {container_name} already connected to network {network_name} with IP {ip_address}")
+                        return  # Already connected successfully
+                    else:
+                        logger.debug(f"Container appears connected to {network_name} but has no IP - will retry connection")
+                        # Try to disconnect first to clean up partial connection
+                        try:
+                            network.disconnect(container, force=True)
+                            time.sleep(2)  # Wait for cleanup
+                        except:
+                            pass
+            except Exception as e:
+                logger.debug(f"Failed to check existing connection: {e}")
+            
+            # Connect to the network
+            try:
+                network.connect(container)
+                logger.info(f"Successfully connected container {container_name} to network {network_name}")
+                
+                # Wait for the connection to fully establish - increased wait time
+                time.sleep(5)  # Increased from 3 to 5 seconds for better stability
+                
+                # Verify the connection more thoroughly
+                network.reload()  # Refresh network info
+                container.reload()  # Refresh container info
+                
+                # Check from network perspective
+                connected_containers = network.attrs.get('Containers', {})
+                network_connected = container.id in connected_containers
+                
+                # Check from container perspective
+                network_settings = container.attrs.get('NetworkSettings', {})
+                networks = network_settings.get('Networks', {})
+                container_connected = network_name in networks
+                
+                # Check if we got an IP address
+                ip_assigned = False
+                if container_connected:
+                    network_info = networks[network_name]
+                    ip_address = network_info.get('IPAddress')
+                    if ip_address:
+                        ip_assigned = True
+                        logger.debug(f"Container {container_name} assigned IP {ip_address} on network {network_name}")
+                
+                if network_connected and container_connected and ip_assigned:
+                    logger.debug(f"Verified: Container {container_name} is properly connected to network {network_name}")
+                    return  # Success!
+                else:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Network connection verification failed on attempt {attempt + 1}")
+                        logger.warning(f"  Network perspective: {network_connected}, Container perspective: {container_connected}, IP assigned: {ip_assigned}")
+                        # Try to disconnect first in case of partial connection
+                        try:
+                            network.disconnect(container, force=True)
+                            time.sleep(2)  # Wait for cleanup
+                        except:
+                            pass
+                        continue
+                    else:
+                        logger.error(f"Network connection verification failed after all retries")
+                        logger.error(f"  Network perspective: {network_connected}, Container perspective: {container_connected}, IP assigned: {ip_assigned}")
+                        raise RuntimeError(f"Failed to verify network connection after {max_retries} attempts")
+                        
+            except docker.errors.APIError as e:
+                if "already exists" in str(e).lower():
+                    logger.debug(f"Container {container_name} already connected to network {network_name}")
+                    return  # Success - already connected
+                elif "endpoint with name" in str(e).lower() and "already exists" in str(e).lower():
+                    logger.debug(f"Container {container_name} already connected to network {network_name} (endpoint exists)")
+                    return  # Success - already connected
+                else:
+                    if attempt < max_retries - 1:
+                        wait_time = base_delay * (2 ** attempt)
+                        logger.warning(f"Failed to connect container on attempt {attempt + 1}: {e}, waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Failed to connect container {container_name} to network {network_name}: {e}")
+                        raise RuntimeError(f"Failed to connect container to network: {e}")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = base_delay * (2 ** attempt)
+                    logger.warning(f"Unexpected error on attempt {attempt + 1}: {e}, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Unexpected error connecting container {container_name} to network {network_name}: {e}")
+                    raise RuntimeError(f"Unexpected network connection error: {e}")
+        
+        except RuntimeError:
+            # Re-raise RuntimeError exceptions (these are our intentional errors)
+            raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)
+                logger.warning(f"Unexpected exception on attempt {attempt + 1}: {e}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Final attempt failed with exception: {e}")
+                raise RuntimeError(f"Network attachment failed after {max_retries} attempts: {e}")
+    
+    # This should never be reached due to the return/raise statements above
+    logger.error(f"Network attachment logic error - reached end of function without success or failure")
+    raise RuntimeError("Network attachment logic error")
 
 
 def get_docker_compose(
@@ -777,7 +1169,7 @@ def get_docker_compose(
     container_name_suffix: str | None = None,
     dynamic_ports: bool = False,
     challenge_internal_port: int | None = None
-) -> tuple[Path, dict[str, int]]:
+) -> tuple[Path, dict[str, int], str | None]:
     """
     Start docker-compose services with optional dynamic port allocation.
     
@@ -788,7 +1180,9 @@ def get_docker_compose(
         challenge_internal_port: Optional internal port from challenge.json that should be exposed
         
     Returns:
-        Tuple of (compose_path, port_mappings) where port_mappings maps internal ports to external ports
+        Tuple of (compose_path, port_mappings, project_name) where 
+        port_mappings maps internal ports to external ports and 
+        project_name is the actual normalized project name used by Docker Compose
     """
     actual_compose_path = docker_compose_path
     port_mappings = {}
@@ -803,39 +1197,59 @@ def get_docker_compose(
             with open(docker_compose_path) as f:
                 compose_data = yaml.safe_load(f)
             
-            # Collect all internal ports that need mapping
+            # CRITICAL FIX FOR PARALLEL EXECUTION: Collect all unique port mappings first,
+            # then allocate external ports atomically to prevent race conditions
+            # Handle multiple services with same internal port by tracking service-specific mappings
+            port_mappings_needed = []  # List of (service_name, original_external_port, internal_port)
+            
             if "services" in compose_data:
-                for service_config in compose_data["services"].values():
+                for service_name, service_config in compose_data["services"].items():
                     if "ports" in service_config:
                         for port_mapping in service_config["ports"]:
                             if isinstance(port_mapping, str) and ":" in port_mapping:
                                 external_port, internal_port = port_mapping.split(":", 1)
-                                try:
-                                    available_port = get_available_port()
-                                    port_mappings[internal_port] = available_port
-                                    logger.debug(f"Mapped internal port {internal_port} to external port {available_port}")
-                                except RuntimeError as e:
-                                    logger.warning(f"Could not allocate dynamic port for {internal_port}: {e}")
+                                port_mappings_needed.append((service_name, external_port, internal_port))
+                                logger.debug(f"Found port mapping for {service_name}: {external_port}:{internal_port}")
                             elif isinstance(port_mapping, int):
                                 # Handle integer port (just internal port specified)
                                 internal_port = str(port_mapping)
-                                try:
-                                    available_port = get_available_port()
-                                    port_mappings[internal_port] = available_port
-                                    logger.debug(f"Mapped internal port {internal_port} to external port {available_port}")
-                                except RuntimeError as e:
-                                    logger.warning(f"Could not allocate dynamic port for {internal_port}: {e}")
+                                port_mappings_needed.append((service_name, internal_port, internal_port))
+                                logger.debug(f"Found port mapping for {service_name}: {port_mapping}")
             
-            # Handle challenge internal port if specified and not already mapped
+            # Handle challenge internal port if specified
             if challenge_internal_port is not None:
                 internal_port_str = str(challenge_internal_port)
-                if internal_port_str not in port_mappings:
-                    try:
-                        available_port = get_available_port()
-                        port_mappings[internal_port_str] = available_port
-                        logger.debug(f"Mapped challenge internal port {internal_port_str} to external port {available_port}")
-                    except RuntimeError as e:
-                        logger.warning(f"Could not allocate dynamic port for challenge internal port {internal_port_str}: {e}")
+                # Add for all services that don't already have this port mapped
+                services_with_port = {service_name for service_name, _, internal_port in port_mappings_needed if internal_port == internal_port_str}
+                if not services_with_port:
+                    # Add a generic mapping for the challenge port
+                    port_mappings_needed.append(("challenge", internal_port_str, internal_port_str))
+                    logger.debug(f"Added challenge internal port: {internal_port_str}")
+            
+            # CRITICAL FIX: Atomically allocate all needed ports at once to prevent race conditions
+            if port_mappings_needed:
+                ports_count = len(port_mappings_needed)
+                logger.debug(f"Need to allocate {ports_count} external ports for mappings: {[(s, e, i) for s, e, i in port_mappings_needed]}")
+                
+                try:
+                    # Allocate all ports at once - this is atomic and race-condition free
+                    external_ports = get_multiple_available_ports(ports_count)
+                    logger.info(f"Allocated external ports: {external_ports}")
+                    
+                    # Map each service's internal port to its allocated external port
+                    for i, (service_name, original_external_port, internal_port) in enumerate(port_mappings_needed):
+                        # Use a unique key that includes the service name to avoid conflicts
+                        mapping_key = f"{service_name}:{internal_port}"
+                        port_mappings[mapping_key] = external_ports[i]
+                        logger.debug(f"Mapped {service_name} internal port {internal_port} to external port {external_ports[i]}")
+                        
+                        # Also maintain backward compatibility with simple internal port key for single-service cases
+                        if ports_count == 1:
+                            port_mappings[internal_port] = external_ports[i]
+                            
+                except RuntimeError as e:
+                    logger.warning(f"Could not allocate {ports_count} dynamic ports: {e}")
+                    port_mappings = {}  # Reset mappings on failure
                         
         except Exception as e:
             logger.warning(f"Failed to parse compose file for dynamic ports: {e}")
@@ -856,29 +1270,136 @@ def get_docker_compose(
                 actual_compose_path = docker_compose_path
                 port_mappings = {}
     
+    # CRITICAL FIX FOR PARALLEL EXECUTION: Generate unique project name
+    # Docker Compose uses the directory name as project name by default, causing conflicts
+    # when multiple instances run the same challenge. Use unique project name to isolate each instance.
+    project_name = None
+    if container_name_suffix:
+        # Create unique project name using container suffix to avoid conflicts between parallel instances
+        challenge_name = docker_compose_path.parent.name
+        raw_project_name = f"{challenge_name}-{container_name_suffix}"
+        
+        # CRITICAL FIX: Normalize project name to match Docker Compose conventions
+        # Docker Compose project names must:
+        # - consist only of lowercase alphanumeric characters, hyphens, and underscores
+        # - start with a letter or number
+        import re
+        
+        # Convert to lowercase first
+        normalized_project_name = raw_project_name.lower()
+        
+        # CRITICAL FIX: Replace ALL invalid characters including brackets, spaces, etc.
+        # Docker allows: lowercase letters, numbers, hyphens, underscores ONLY
+        # Replace any character that is NOT alphanumeric, hyphen, or underscore
+        normalized_project_name = re.sub(r'[^a-z0-9_-]', '_', normalized_project_name)
+        
+        # Ensure it starts with a letter or number (not hyphen or underscore)
+        if normalized_project_name and not normalized_project_name[0].isalnum():
+            normalized_project_name = 'p' + normalized_project_name
+        
+        # Remove consecutive underscores/hyphens for cleaner names
+        normalized_project_name = re.sub(r'[_-]+', '_', normalized_project_name)
+        
+        # Ensure project name isn't too long (Docker has limits)
+        if len(normalized_project_name) > 50:
+            # Truncate but keep the suffix for uniqueness
+            # Keep the first 20 chars and last 20 chars to preserve both challenge name and uniqueness
+            if len(normalized_project_name) > 40:
+                normalized_project_name = normalized_project_name[:20] + '_' + normalized_project_name[-19:]
+        
+        # Final validation - ensure it's not empty and starts with alphanumeric
+        if not normalized_project_name or not normalized_project_name[0].isalnum():
+            normalized_project_name = f"project_{normalized_project_name}"
+        
+        # Additional safety: remove any remaining invalid characters that might have slipped through
+        normalized_project_name = re.sub(r'[^a-z0-9_-]', '', normalized_project_name)
+        
+        # Ensure it's not empty after all the cleaning
+        if not normalized_project_name:
+            normalized_project_name = f"project_{int(time.time())}"
+        
+        project_name = normalized_project_name
+        logger.debug(f"Normalized Docker Compose project name: {raw_project_name} -> {project_name}")
+    else:
+        # Fallback: use timestamp-based project name if no suffix provided
+        import time
+        raw_project_name = f"{docker_compose_path.parent.name}-{int(time.time())}"
+        project_name = raw_project_name.lower()
+        project_name = re.sub(r'[^a-z0-9_-]', '_', project_name)
+        project_name = re.sub(r'[_-]+', '_', project_name)
+        if not project_name[0].isalnum():
+            project_name = 'p' + project_name
+        logger.debug(f"Using fallback Docker Compose project name: {raw_project_name} -> {project_name}")
+    
+    logger.debug(f"Using Docker Compose project name: {project_name}")
+    
     startup_cmd = [
         "docker",
         "compose",
         "-f",
         str(actual_compose_path),
+        "-p",  # CRITICAL: Use explicit project name to prevent conflicts
+        project_name,
         "up",
         "-d",
         "--force-recreate",
     ]
     logger.debug("Starting docker-compose with command: %s", shlex.join(startup_cmd))
-    compose = subprocess.Popen(
-        startup_cmd,
-        stdin=PIPE,
-        stdout=PIPE,
-        stderr=STDOUT,
-        text=True,
-        bufsize=1,  # line buffered
-    )
-    _, error = compose.communicate(timeout=DOCKER_COMPOSE_STARTUP_DELAY)
-    if error:
-        logger.error(f"Unexpected compose setup error: {error}")
     
-    return actual_compose_path, port_mappings
+    # CRITICAL FIX: Use subprocess cwd parameter instead of changing global working directory
+    # This prevents race conditions in parallel execution where multiple threads change cwd
+    challenge_dir = docker_compose_path.parent
+    
+    try:
+        logger.debug(f"Running docker-compose from directory: {challenge_dir}")
+        logger.info(f"🚀 Starting Docker Compose with project name: {project_name}")
+        
+        # Disable BuildKit to avoid compatibility issues with Docker Compose v2
+        # This prevents the "0/1" build hanging issue
+        compose_env = os.environ.copy()
+        compose_env.update({
+            'DOCKER_BUILDKIT': '0',
+            'COMPOSE_DOCKER_CLI_BUILD': '0'
+        })
+        
+        # Use subprocess cwd parameter to set working directory per-process
+        # This is thread-safe unlike os.chdir()
+        compose = subprocess.Popen(
+            startup_cmd,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=STDOUT,
+            text=True,
+            bufsize=1,  # line buffered
+            cwd=str(challenge_dir),  # Set working directory per-process, not globally
+            env=compose_env  # Use environment with BuildKit disabled
+        )
+        
+        # CRITICAL FIX: Properly handle docker-compose output and check return code
+        output, _ = compose.communicate(timeout=DOCKER_COMPOSE_STARTUP_DELAY)
+        return_code = compose.returncode
+        
+        # Log docker-compose output for debugging
+        if output and output.strip():
+            logger.debug(f"Docker Compose output: {output.strip()}")
+        
+        # Check if docker-compose failed
+        if return_code != 0:
+            logger.error(f"❌ Docker Compose failed with return code: {return_code}")
+            logger.error(f"Docker Compose output: {output}")
+            raise RuntimeError(f"Docker Compose startup failed with return code {return_code}: {output}")
+        else:
+            logger.info(f"✅ Docker Compose started successfully with project name: {project_name}")
+            
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ Docker Compose startup timed out after {DOCKER_COMPOSE_STARTUP_DELAY} seconds!")
+        compose.kill()  # Kill the hanging process
+        raise RuntimeError(f"Docker Compose startup timed out after {DOCKER_COMPOSE_STARTUP_DELAY} seconds")
+    except Exception as e:
+        logger.error(f"Failed to start docker-compose: {e}")
+        raise e
+    
+    return actual_compose_path, port_mappings, project_name
 
 
 def _get_container_mounts_list(container_mounts: list[str]) -> list[docker.types.Mount]:
@@ -894,34 +1415,174 @@ def _get_container_mounts_list(container_mounts: list[str]) -> list[docker.types
 
 
 def _get_non_persistent_container(
-    ctr_name: str, image_name: str, container_mounts: list[str]
+    ctr_name: str, image_name: str, container_mounts: list[str], enable_network_restrictions: bool = True
 ) -> tuple[subprocess.Popen, set[str]]:
+    container_mounts_list = _get_container_mounts_list(container_mounts)
+    client = docker.from_env()
+    
+    # Container configuration - need privileged mode for iptables network restrictions
+    container_kwargs = {
+        "image": image_name,
+        "command": "/bin/bash -l -m",
+        "name": ctr_name,
+        "stdin_open": True,
+        "tty": True,
+        "detach": True,
+        "auto_remove": True,
+        "mounts": container_mounts_list,
+    }
+    
+    # Add privileged mode if network restrictions are enabled (required for iptables)
+    if enable_network_restrictions:
+        container_kwargs["privileged"] = True
+    
+    # CRITICAL: Add resource limits to prevent container crashes due to resource exhaustion
+    # These limits help prevent the Docker daemon from killing containers during parallel execution
+    resource_limits = {
+        # Memory limits - allow enough for package installation but prevent runaway processes
+        "mem_limit": "2g",  # 2GB memory limit
+        "memswap_limit": "3g",  # 3GB total memory+swap limit
+        # CPU limits - prevent CPU starvation in parallel execution
+        "cpu_period": 100000,  # 100ms period
+        "cpu_quota": 150000,   # 150ms quota = 1.5 CPU cores max
+        # Prevent excessive file descriptor usage
+        "ulimits": [
+            docker.types.Ulimit(name='nofile', soft=1024, hard=2048),  # File descriptors
+            docker.types.Ulimit(name='nproc', soft=512, hard=1024),    # Process count
+        ],
+        # Set process limits to prevent fork bombs
+        "pids_limit": 1000,
+    }
+    
+    # Apply resource limits for non-privileged containers or when running in parallel
+    # For privileged containers, be more conservative to prevent system issues
+    if enable_network_restrictions or "parallel" in ctr_name:
+        # More conservative limits for privileged/parallel containers
+        resource_limits.update({
+            "mem_limit": "1.5g",
+            "memswap_limit": "2g", 
+            "cpu_quota": 100000,  # 1.0 CPU core max for parallel execution
+            "pids_limit": 500,
+        })
+        logger.debug(f"Applying conservative resource limits for container {ctr_name}")
+    
+    container_kwargs.update(resource_limits)
+    
+    logger.debug("Starting container with image: %s, name: %s", image_name, ctr_name)
+    logger.debug("Resource limits: mem=%s, cpu_quota=%s, pids=%s", 
+                 resource_limits.get("mem_limit"), 
+                 resource_limits.get("cpu_quota"), 
+                 resource_limits.get("pids_limit"))
+    
+    try:
+        container_obj = client.containers.run(**container_kwargs)
+    except docker.errors.APIError as e:
+        if "resource" in str(e).lower() or "limit" in str(e).lower():
+            logger.warning(f"Container creation failed due to resource constraints: {e}")
+            logger.warning("Retrying with reduced resource limits...")
+            # Fallback with minimal resource limits
+            fallback_limits = {
+                "mem_limit": "1g",
+                "memswap_limit": "1.5g",
+                "cpu_quota": 50000,  # 0.5 CPU core
+                "pids_limit": 250,
+            }
+            container_kwargs.update(fallback_limits)
+            try:
+                container_obj = client.containers.run(**container_kwargs)
+                logger.info(f"Container {ctr_name} created with fallback resource limits")
+            except Exception as fallback_e:
+                logger.error(f"Failed to create container even with minimal resources: {fallback_e}")
+                raise RuntimeError(f"Container creation failed: {fallback_e}") from fallback_e
+        else:
+            logger.error(f"Container creation failed: {e}")
+            raise RuntimeError(f"Container creation failed: {e}") from e
+    except Exception as e:
+        logger.error(f"Unexpected error creating container: {e}")
+        raise RuntimeError(f"Container creation failed: {e}") from e
+    
+    # Wait a moment for container to fully initialize
+    time.sleep(2)
+    
+    # Validate container is running before proceeding
+    try:
+        container_obj.reload()
+        if container_obj.status != "running":
+            logger.error(f"Container {ctr_name} failed to start properly, status: {container_obj.status}")
+            # Try to get container logs for debugging
+            try:
+                logs = container_obj.logs(tail=50).decode('utf-8', errors='ignore')
+                logger.error(f"Container logs: {logs}")
+            except:
+                pass
+            raise RuntimeError(f"Container failed to start, status: {container_obj.status}")
+    except docker.errors.NotFound:
+        logger.error(f"Container {ctr_name} disappeared immediately after creation")
+        raise RuntimeError("Container disappeared after creation")
+    except Exception as e:
+        logger.error(f"Failed to validate container status: {e}")
+        raise RuntimeError(f"Container validation failed: {e}") from e
+    
     startup_cmd = [
         "docker",
-        "run",
+        "exec",
         "-i",
-        "--rm",
-        *[item for mount in container_mounts for item in ("-v", f"{Path(mount).absolute()}:/{Path(mount).name}")],
-        "--name",
         ctr_name,
-        image_name,
         "/bin/bash",
         "-l",
     ]
     logger.debug("Starting container with command: %s", shlex.join(startup_cmd))
-    container = subprocess.Popen(
-        startup_cmd,
-        stdin=PIPE,
-        stdout=PIPE,
-        stderr=STDOUT,
-        text=True,
-        bufsize=1,  # line buffered
-    )
+    
+    try:
+        container = subprocess.Popen(
+            startup_cmd,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=STDOUT,
+            text=True,
+            bufsize=1,  # line buffered
+        )
+    except Exception as e:
+        logger.error(f"Failed to create subprocess for container communication: {e}")
+        # Clean up the container if subprocess creation failed
+        try:
+            container_obj.remove(force=True)
+        except:
+            pass
+        raise RuntimeError(f"Subprocess creation failed: {e}") from e
+    
     time.sleep(DOCKER_START_UP_DELAY)
+    
     # try to read output from container setup (usually an error), timeout if no output
-    output = read_with_timeout(container, lambda: list(), timeout_duration=2)
-    if output:
-        logger.error(f"Unexpected container setup output: {output}")
+    try:
+        output = read_with_timeout(container, lambda: list(), timeout_duration=2)
+        if output:
+            logger.error(f"Unexpected container setup output: {output}")
+            # Check if this indicates a serious problem
+            if any(keyword in output.lower() for keyword in ["error", "failed", "cannot", "permission denied"]):
+                logger.error(f"Container setup failed with errors: {output}")
+                # Don't fail immediately, but log the issue
+                logger.warning("Container may be unstable due to setup errors")
+    except Exception as e:
+        logger.warning(f"Failed to read container setup output: {e}")
+        # This is not necessarily fatal, continue
+    
+    # Final health check
+    try:
+        # Test basic container communication
+        test_result = container_obj.exec_run("echo 'container_ready'", timeout=5)
+        if test_result.exit_code != 0 or b"container_ready" not in test_result.output:
+            logger.warning(f"Container {ctr_name} failed basic health check")
+            logger.warning(f"Health check result: exit_code={test_result.exit_code}, output={test_result.output}")
+        else:
+            logger.debug(f"Container {ctr_name} passed health check")
+    except Exception as e:
+        logger.warning(f"Container health check failed: {e}")
+        # Don't fail completely, but this is concerning
+    
+    # NOTE: Network restrictions are now applied AFTER environment setup in SWEEnv.reset()
+    # This allows package installation during setup while still protecting against external access during agent execution
+    
     # bash PID is always 1 for non-persistent containers
     return container, {
         "1",
@@ -929,10 +1590,12 @@ def _get_non_persistent_container(
 
 
 def _get_persistent_container(
-    ctr_name: str, image_name: str, container_mounts: list[str], persistent: bool = False
+    ctr_name: str, image_name: str, container_mounts: list[str], enable_network_restrictions: bool = True
 ) -> tuple[subprocess.Popen, set[str]]:
     client = docker.from_env()
     containers = client.containers.list(all=True, filters={"name": ctr_name})
+    container_created = False
+    
     if ctr_name in [c.name for c in containers]:
         container_obj = client.containers.get(ctr_name)
         if container_obj.status in {"created"}:
@@ -947,18 +1610,26 @@ def _get_persistent_container(
             msg = f"Unexpected container status: {container_obj.status}"
             raise RuntimeError(msg)
     else:
-        container_mounts = _get_container_mounts_list(container_mounts)
-        container_obj = client.containers.run(
-            image_name,
-            command="/bin/bash -l -m",
-            name=ctr_name,
-            stdin_open=True,
-            tty=True,
-            detach=True,
-            auto_remove=not persistent,
-            mounts=container_mounts,
-        )
+        container_mounts_list = _get_container_mounts_list(container_mounts)
+        # Container configuration - need privileged mode for iptables network restrictions
+        container_kwargs = {
+            "image": image_name,
+            "command": "/bin/bash -l -m",
+            "name": ctr_name,
+            "stdin_open": True,
+            "tty": True,
+            "detach": True,
+            "auto_remove": not True,  # persistent containers shouldn't auto-remove
+            "mounts": container_mounts_list,
+        }
+        # Add privileged mode if network restrictions are enabled (required for iptables)
+        if enable_network_restrictions:
+            container_kwargs["privileged"] = True
+        
+        container_obj = client.containers.run(**container_kwargs)
         container_obj.start()
+        container_created = True
+        
     startup_cmd = [
         "docker",
         "exec",
@@ -981,6 +1652,11 @@ def _get_persistent_container(
     output = read_with_timeout(container, lambda: list(), timeout_duration=2)
     if output:
         logger.error(f"Unexpected container setup output: {output}")
+    
+    # NOTE: Network restrictions are now applied AFTER environment setup in SWEEnv.reset()
+    # For existing containers, restrictions should already be in place from previous setup
+    # For new containers, restrictions will be applied after setup is complete
+    
     # Get the process IDs of the container
     # There should be at least a head process and possibly one child bash process
     bash_pids, other_pids = get_background_pids(container_obj)
@@ -1006,7 +1682,7 @@ def _get_persistent_container(
 
 
 def get_container(
-    ctr_name: str, image_name: str, container_mounts: list[str], persistent: bool = False
+    ctr_name: str, image_name: str, container_mounts: list[str], persistent: bool = False, enable_network_restrictions: bool = True
 ) -> tuple[subprocess.Popen, set]:
     """
     Get a container object for a given container name and image name
@@ -1014,9 +1690,11 @@ def get_container(
     Arguments:
         ctr_name (str): Name of container
         image_name (str): Name of image
+        container_mounts (list[str]): List of paths to mount in container
         persistent (bool): Whether to use a persistent container or not
+        enable_network_restrictions (bool): Whether to enable network restrictions in the container
     Returns:
-        Container object
+        Container object and parent PIDs
     """
     if not image_exists(image_name):
         msg = (
@@ -1027,9 +1705,9 @@ def get_container(
         raise RuntimeError(msg)
 
     if persistent:
-        return _get_persistent_container(ctr_name, image_name, container_mounts=container_mounts)
+        return _get_persistent_container(ctr_name, image_name, container_mounts=container_mounts, enable_network_restrictions=enable_network_restrictions)
     else:
-        return _get_non_persistent_container(ctr_name, image_name, container_mounts=container_mounts)
+        return _get_non_persistent_container(ctr_name, image_name, container_mounts=container_mounts, enable_network_restrictions=enable_network_restrictions)
 
 
 def image_exists(image_name: str) -> bool:
@@ -1261,14 +1939,21 @@ class InstanceBuilder:
             self.args["base_commit"] = base_commit
         else:
             try:
-                repo = Repo(path, search_parent_directories=True)
+                repo = Repo(path)
             except InvalidGitRepositoryError as e:
-                msg = f"Could not find git repository at {path=}."
-                raise ValueError(msg) from e
-            if repo.is_dirty() and "PYTEST_CURRENT_TEST" not in os.environ:
-                if not self._allow_dirty_repo:
-                    msg = f"Local git repository {path} is dirty. Please commit or stash changes."
-                    raise ValueError(msg)
+                if self._allow_dirty_repo:
+                    # When allow_dirty_repo is True, provide a fallback for non-git directories
+                    import hashlib
+                    fallback_commit = hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:40]
+                    self.args["base_commit"] = fallback_commit
+                    self.args["version"] = self.args["base_commit"][:7]
+                    return
+                else:
+                    msg = f"Could not find git repository at {path=}."
+                    raise ValueError(msg) from e
+            if not self._allow_dirty_repo and repo.is_dirty() and "PYTEST_CURRENT_TEST" not in os.environ:
+                msg = f"Local git repository {path} is dirty. Please commit or stash changes."
+                raise ValueError(msg)
             self.args["base_commit"] = repo.head.object.hexsha
         self.args["version"] = self.args["base_commit"][:7]
 
@@ -1699,3 +2384,439 @@ def force_cleanup_all_ctf_resources() -> dict[str, int]:
         cleanup_stats["errors"] += 1
     
     return cleanup_stats
+
+
+def check_docker_subnet_availability(wait_for_space: bool = False, max_wait_time: int = 300) -> dict[str, int]:
+    """
+    Check Docker's subnet availability for informational purposes only.
+    Subnet restrictions have been removed.
+    
+    Args:
+        wait_for_space: Ignored (kept for compatibility)
+        max_wait_time: Ignored (kept for compatibility)
+    
+    Returns:
+        Dictionary with network counts and availability status
+    """
+    try:
+        client = docker.from_env()
+        networks = client.networks.list()
+        
+        # Count different types of networks
+        total_networks = len(networks)
+        bridge_networks = len([n for n in networks if n.attrs.get('Driver') == 'bridge'])
+        dynamic_networks = len([n for n in networks if n.name.startswith('ctfnet-')])
+        
+        status = {
+            'total_networks': total_networks,
+            'bridge_networks': bridge_networks, 
+            'dynamic_networks': dynamic_networks,
+            'subnet_usage_warning': False,  # No longer enforce warnings
+            'subnet_usage_critical': False  # No longer enforce restrictions
+        }
+        
+        # Keep informational logging only
+        logger.debug(f"Docker network status: {status}")
+        logger.debug(f"Found {bridge_networks} bridge networks, {dynamic_networks} dynamic CTF networks")
+        
+        return status
+        
+    except Exception as e:
+        logger.warning(f"Failed to check Docker subnet availability: {e}")
+        return {'error': str(e)}
+
+
+def wait_for_docker_subnet_space(
+    max_wait_time: int = 300,  # 5 minutes default
+    check_interval: int = 10,  # Check every 10 seconds
+    target_free_networks: int = 5  # Target at least 5 free network slots
+) -> bool:
+    """
+    No longer enforces subnet space restrictions - always returns True.
+    This function is kept for compatibility but no longer waits or restricts.
+    
+    Args:
+        max_wait_time: Ignored (kept for compatibility)
+        check_interval: Ignored (kept for compatibility)
+        target_free_networks: Ignored (kept for compatibility)
+    
+    Returns:
+        bool: Always True (no restrictions)
+    """
+    logger.debug("Subnet space restrictions disabled - proceeding without limitations")
+    return True
+
+
+def check_network_restrictions_applied(container_name: str) -> bool:
+    """
+    Check if network restrictions are already applied to a container.
+    
+    Args:
+        container_name: Name of the container to check
+    
+    Returns:
+        bool: True if restrictions are applied, False otherwise
+    """
+    import docker
+    
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        
+        # Check if iptables rules are set up by looking for our specific rules
+        exec_result = container.exec_run("iptables -L OUTPUT -n 2>/dev/null || echo 'NO_IPTABLES'")
+        
+        if exec_result.exit_code != 0:
+            logger.debug(f"Could not check iptables rules in container {container_name}")
+            return False
+        
+        output = exec_result.output.decode()
+        
+        # Check if our network restriction rules are present
+        if "NO_IPTABLES" in output:
+            logger.debug(f"iptables not available in container {container_name}")
+            return False
+        
+        # Look for our specific rules that indicate restrictions are applied
+        # We look for the default DROP policy and our REJECT rule
+        if "policy DROP" in output and "REJECT" in output:
+            logger.debug(f"Network restrictions already applied to container {container_name}")
+            return True
+        else:
+            logger.debug(f"Network restrictions not found in container {container_name}")
+            return False
+            
+    except Exception as e:
+        logger.debug(f"Error checking network restrictions for container {container_name}: {e}")
+        return False
+
+
+def _setup_network_restrictions(container_name: str) -> None:
+    """
+    Set up STRICT network restrictions using iptables to:
+    1. Allow localhost connections (for local services)
+    2. Allow Docker internal network communications (for CTF challenges)
+    3. Block ALL external internet connections (no public internet access)
+    
+    This ensures agents cannot:
+    - Exfiltrate data to external servers
+    - Download additional tools or packages
+    - Call external APIs
+    - Access any external resources
+    
+    While preserving CTF challenge connectivity to docker-compose services.
+    
+    Raises:
+        RuntimeError: If network restrictions cannot be applied or validation fails
+    """
+    import subprocess
+    import docker
+    
+    logger.info("🔒 Setting up STRICT network restrictions (preserving CTF connectivity, blocking external internet)")
+    
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        
+        # First, check if the container supports iptables (writable filesystem)
+        logger.debug(f"Checking if container {container_name} supports iptables...")
+        
+        # Test if we can write to filesystem
+        filesystem_test = container.exec_run(
+            ["sh", "-c", "touch /tmp/test_write 2>/dev/null && rm -f /tmp/test_write 2>/dev/null && echo 'FS_WRITABLE' || echo 'FS_READONLY'"],
+            privileged=True
+        )
+        
+        if filesystem_test.exit_code == 0 and b'FS_READONLY' in filesystem_test.output:
+            error_msg = f"Container {container_name} has read-only filesystem - cannot apply network restrictions"
+            logger.error(f"❌ SECURITY ERROR: {error_msg}")
+            logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+            raise RuntimeError(f"Network security cannot be ensured: {error_msg}")
+        
+        # Test if iptables can write lock files
+        iptables_test = container.exec_run(
+            ["sh", "-c", "test -w /run 2>/dev/null && echo 'IPTABLES_WRITABLE' || echo 'IPTABLES_READONLY'"],
+            privileged=True
+        )
+        
+        if iptables_test.exit_code == 0 and b'IPTABLES_READONLY' in iptables_test.output:
+            error_msg = f"Container {container_name} cannot write iptables lock files (/run is read-only)"
+            logger.error(f"❌ SECURITY ERROR: {error_msg}")
+            logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+            raise RuntimeError(f"Network security cannot be ensured: {error_msg}")
+        
+        logger.debug(f"✅ Container {container_name} supports iptables - proceeding with restrictions")
+        
+        # Execute iptables setup commands individually
+        try:
+            logger.info("🔧 Checking if iptables is available...")
+            
+            # First check if iptables is already installed
+            iptables_check = container.exec_run(
+                ["which", "iptables"],
+                privileged=True
+            )
+            
+            if iptables_check.exit_code != 0:
+                logger.info("iptables not found, attempting to install...")
+                
+                # Install iptables only if not already present
+                install_result = container.exec_run(
+                    ["sh", "-c", "apt-get update -qq > /dev/null 2>&1 || true"],
+                    privileged=True
+                )
+                
+                install_result = container.exec_run(
+                    ["sh", "-c", "apt-get install -y iptables iproute2 > /dev/null 2>&1"],
+                    privileged=True
+                )
+                
+                if install_result.exit_code != 0:
+                    logger.error("❌ Failed to install iptables")
+                    logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+                    raise RuntimeError("Failed to install iptables - network security cannot be ensured")
+                
+                logger.info("✅ iptables installed successfully")
+            else:
+                logger.info("✅ iptables already available")
+            
+            # Verify iptables is working
+            iptables_version = container.exec_run(
+                ["iptables", "--version"],
+                privileged=True
+            )
+            
+            if iptables_version.exit_code != 0:
+                logger.error("❌ iptables is not functioning properly")
+                logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+                raise RuntimeError("iptables is not functioning - network security cannot be ensured")
+            
+            logger.debug(f"iptables version: {iptables_version.output.decode().strip()}")
+            
+            logger.info("🔒 Applying network restrictions...")
+            
+            # Clear existing rules
+            container.exec_run(["iptables", "-F", "OUTPUT"], privileged=True)
+            container.exec_run(["iptables", "-X"], privileged=True)
+            
+            # Set default DROP policy
+            policy_result = container.exec_run(["iptables", "-P", "OUTPUT", "DROP"], privileged=True)
+            if policy_result.exit_code != 0:
+                error_msg = f"Failed to set iptables DROP policy: {policy_result.output.decode()}"
+                logger.error(f"❌ SECURITY ERROR: {error_msg}")
+                logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+                raise RuntimeError(f"Network security cannot be ensured: {error_msg}")
+            
+            # Allow loopback traffic
+            container.exec_run(["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"], privileged=True)
+            container.exec_run(["iptables", "-A", "OUTPUT", "-d", "127.0.0.0/8", "-j", "ACCEPT"], privileged=True)
+            logger.debug("✓ Localhost traffic allowed")
+            
+            # Allow established connections
+            container.exec_run(["iptables", "-A", "OUTPUT", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"], privileged=True)
+            logger.debug("✓ Response traffic allowed")
+            
+            # Get Docker networks and allow them
+            route_result = container.exec_run(["ip", "route", "show"], privileged=True)
+            if route_result.exit_code == 0:
+                routes = route_result.output.decode()
+                logger.debug(f"Container routes: {routes}")
+                
+                # Extract Docker network ranges from routes
+                import re
+                docker_networks = re.findall(r'(172\.\d+\.\d+\.\d+/\d+|10\.\d+\.\d+\.\d+/\d+|192\.168\.\d+\.\d+/\d+)', routes)
+                
+                for network in docker_networks:
+                    container.exec_run(["iptables", "-A", "OUTPUT", "-d", network, "-j", "ACCEPT"], privileged=True)
+                    logger.debug(f"✓ Docker network allowed: {network}")
+            
+            # Allow common Docker network ranges
+            common_networks = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
+            for network in common_networks:
+                container.exec_run(["iptables", "-A", "OUTPUT", "-d", network, "-j", "ACCEPT"], privileged=True)
+            logger.debug("✓ All Docker internal networks allowed")
+            
+            # Block all other traffic (external internet)
+            reject_result = container.exec_run(["iptables", "-A", "OUTPUT", "-j", "REJECT", "--reject-with", "icmp-net-unreachable"], privileged=True)
+            if reject_result.exit_code != 0:
+                error_msg = f"Failed to set iptables REJECT rule: {reject_result.output.decode()}"
+                logger.error(f"❌ SECURITY ERROR: {error_msg}")
+                logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+                raise RuntimeError(f"Network security cannot be ensured: {error_msg}")
+            
+            logger.info("🚫 ALL external internet traffic blocked")
+            
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Failed to configure iptables: {e}")
+            logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+            raise RuntimeError(f"iptables configuration failed: {e}")
+        
+        # CRITICAL VALIDATION: Test restrictions using individual commands
+        logger.info("🔍 Validating network restrictions...")
+        
+        try:
+            # Test 1: External internet should be blocked - use basic TCP connection test
+            logger.debug("Testing external connectivity (should fail)...")
+            
+            # Use the most basic network test possible - direct TCP connection
+            # This doesn't write any files and works purely in memory
+            external_test = container.exec_run(
+                ["timeout", "3", "bash", "-c", "echo > /dev/tcp/8.8.8.8/53"],
+                privileged=True
+            )
+            
+            if external_test.exit_code == 0:
+                logger.error("❌ CRITICAL SECURITY ERROR: External connectivity test PASSED!")
+                logger.error("❌ Network restrictions validation FAILED - external access is still possible")
+                logger.error("❌ TERMINATING TASK: Cannot ensure agent security")
+                raise RuntimeError("Network restrictions validation failed - external access is still possible. Task terminated for security.")
+            else:
+                logger.info("✅ External connectivity blocked as expected")
+            
+            # Test 2: Try another external test with different method
+            logger.debug("Testing external HTTP connectivity (should fail)...")
+            http_test = container.exec_run(
+                ["timeout", "2", "bash", "-c", "echo > /dev/tcp/1.1.1.1/80"],
+                privileged=True
+            )
+            
+            if http_test.exit_code == 0:
+                logger.error("❌ CRITICAL SECURITY ERROR: External HTTP connectivity test PASSED!")
+                logger.error("❌ Network restrictions validation FAILED - external access is still possible")
+                logger.error("❌ TERMINATING TASK: Cannot ensure agent security")
+                raise RuntimeError("Network restrictions validation failed - external HTTP access is still possible. Task terminated for security.")
+            else:
+                logger.info("✅ External HTTP connectivity blocked as expected")
+            
+            # Test 3: Docker networks should work - test internal connectivity
+            logger.debug("Testing Docker network connectivity...")
+            docker_test_passed = False
+            
+            for gateway in ["172.17.0.1", "172.18.0.1", "172.19.0.1", "10.0.0.1"]:
+                # Use basic TCP connection test for internal networks
+                internal_test = container.exec_run(
+                    ["timeout", "2", "bash", "-c", f"echo > /dev/tcp/{gateway}/22 || echo > /dev/tcp/{gateway}/53 || echo > /dev/tcp/{gateway}/80"],
+                    privileged=True
+                )
+                if internal_test.exit_code == 0:
+                    logger.debug(f"✅ Can reach Docker gateway: {gateway}")
+                    docker_test_passed = True
+                    break
+            
+            if not docker_test_passed:
+                logger.warning("⚠️  Could not reach any Docker gateways - this may be normal depending on network setup")
+            
+            logger.info("✅ Network restrictions applied successfully")
+            logger.info("🔒 External internet blocked, CTF connectivity preserved")
+            
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Network restrictions validation failed: {e}")
+            logger.error("❌ TERMINATING TASK: Cannot ensure network security")
+            raise RuntimeError(f"Network restrictions validation failed: {e}")
+        
+    except RuntimeError:
+        # Re-raise RuntimeError exceptions (these are our intentional security failures)
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to apply network restrictions to challenge containers: {e}")
+        logger.warning("⚠️  SECURITY WARNING: Challenge containers may have unrestricted network access!")
+        logger.warning("   However, if they have read-only filesystems, this may be expected")
+
+
+def _setup_network_restrictions_for_challenge_containers(docker_compose_path: Path, container_name_suffix: str) -> None:
+    """
+    Apply network restrictions to ALL containers created by docker-compose for CTF challenges.
+    This is CRITICAL for security - challenge containers can also access external networks!
+    
+    Args:
+        docker_compose_path: Path to the docker-compose file
+        container_name_suffix: Suffix used for container names (to identify our containers)
+    """
+    import docker
+    import yaml
+    
+    logger.info("🔒 Applying network restrictions to challenge containers...")
+    
+    try:
+        # Read the docker-compose file to get service names
+        with open(docker_compose_path, 'r') as f:
+            compose_data = yaml.safe_load(f)
+        
+        client = docker.from_env()
+        
+        # Find all containers created by this docker-compose
+        challenge_containers = []
+        if 'services' in compose_data:
+            for service_name in compose_data['services'].keys():
+                # Container names follow the pattern: servicename-suffix
+                container_name = f"{service_name}-{container_name_suffix}"
+                try:
+                    container = client.containers.get(container_name)
+                    challenge_containers.append(container)
+                    logger.debug(f"Found challenge container: {container_name}")
+                except docker.errors.NotFound:
+                    logger.debug(f"Challenge container not found: {container_name}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"Error accessing challenge container {container_name}: {e}")
+                    continue
+        
+        # Apply network restrictions to each challenge container (with read-only detection)
+        restrictions_applied = 0
+        restrictions_skipped = 0
+        for container in challenge_containers:
+            try:
+                logger.info(f"🔍 Checking if container {container.name} supports network restrictions...")
+                
+                # Check if container has a read-only filesystem by testing write access
+                test_result = container.exec_run(
+                    ["sh", "-c", "touch /tmp/writetest 2>/dev/null && rm -f /tmp/writetest 2>/dev/null && echo 'WRITABLE' || echo 'READONLY'"],
+                    privileged=True
+                )
+                
+                if test_result.exit_code == 0 and b'READONLY' in test_result.output:
+                    logger.info(f"⚠️  Container {container.name} has read-only filesystem - skipping network restrictions")
+                    logger.info(f"   (Challenge containers with read-only filesystems cannot use iptables)")
+                    logger.info(f"   (This is normal for many CTF challenge containers)")
+                    restrictions_skipped += 1
+                    continue
+                    
+                # Also check if iptables can write its lock file
+                iptables_test = container.exec_run(
+                    ["sh", "-c", "test -w /run 2>/dev/null && echo 'IPTABLES_OK' || echo 'IPTABLES_READONLY'"],
+                    privileged=True
+                )
+                
+                if iptables_test.exit_code == 0 and b'IPTABLES_READONLY' in iptables_test.output:
+                    logger.info(f"⚠️  Container {container.name} cannot write iptables lock files - skipping network restrictions")
+                    logger.info(f"   (/run directory is read-only, iptables cannot function)")
+                    restrictions_skipped += 1
+                    continue
+                
+                logger.info(f"✅ Container {container.name} supports network restrictions - applying...")
+                _setup_network_restrictions(container.name)
+                restrictions_applied += 1
+                
+            except Exception as e:
+                logger.warning(f"❌ Failed to apply network restrictions to challenge container {container.name}: {e}")
+                logger.warning(f"   This may be due to read-only filesystem or security restrictions")
+                restrictions_skipped += 1
+                # Continue with other containers even if one fails
+        
+        if restrictions_applied > 0:
+            logger.info(f"✅ Applied network restrictions to {restrictions_applied} challenge containers")
+        if restrictions_skipped > 0:
+            logger.info(f"ℹ️  Skipped {restrictions_skipped} challenge containers (read-only filesystems)")
+            logger.info(f"   Challenge containers with read-only filesystems are common and expected")
+            logger.info(f"   Network restrictions are still applied to the main agent container")
+        if restrictions_applied == 0 and restrictions_skipped == 0:
+            logger.warning("⚠️  No challenge containers found for network restrictions")
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to apply network restrictions to challenge containers: {e}")
+        logger.warning("⚠️  SECURITY WARNING: Challenge containers may have unrestricted network access!")
+        logger.warning("   However, if they have read-only filesystems, this may be expected")

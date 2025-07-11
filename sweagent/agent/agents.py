@@ -659,7 +659,18 @@ class Agent:
         """
         assert self.config is not None  # mypy
         try:
-            state_vars = json.loads(state)
+            # Try to extract JSON from the state string in case there are shell errors before the JSON
+            # Look for the first '{' and last '}' to extract the JSON part
+            if state and '{' in state:
+                start_idx = state.find('{')
+                end_idx = state.rfind('}')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    json_part = state[start_idx:end_idx + 1]
+                    state_vars = json.loads(json_part)
+                else:
+                    state_vars = json.loads(state)
+            else:
+                state_vars = json.loads(state)
         except json.JSONDecodeError as e:
             msg = f"State {state!r} is not valid json. This is an internal error, please report it."
             raise ValueError(msg) from e
@@ -767,7 +778,7 @@ class Agent:
 
         format_fails = blocklist_fails = 0
 
-        while format_fails + blocklist_fails <= 2:
+        while format_fails + blocklist_fails <= 10:
             try:
                 thought, action = self.config.parse_function(
                     output,

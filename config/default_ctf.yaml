@@ -30,6 +30,8 @@ system_template: |-
   If you'd like to issue two commands at once, PLEASE DO NOT DO THAT! Please instead first submit just the first command, and then after receiving a response you'll be able to issue the second command.
   You're free to use any other bash commands you want (e.g. find, grep, cat, ls, cd) in addition to the special commands listed above.
   However, the environment does NOT support interactive session commands (e.g. python, vim), so please do not invoke them.
+
+  YOU CANNOT ACCESS ANY WEBSITE EXCEPT FOR THE CTF CHALLENGE SERVER! DO NOT PEFORM PORT SCANNING OR ANY OTHER NETWORK SCANNING!
 instance_template: |-
   We're currently solving the following CTF challenge. The CTF challenge is a {category_friendly} problem named "{name}", worth {points} points. The description is:
   {description}

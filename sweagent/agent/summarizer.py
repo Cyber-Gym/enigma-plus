@@ -7,6 +7,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import time
 
 from simple_parsing.helpers.serialization.serializable import FrozenSerializable
 
@@ -118,7 +119,7 @@ class SimpleSummarizer(SummarizeFunction):
     """
 
     _warning_message = """\
-        Warning: Command output exceeded window, saved command to a file {command_file_name} and opened the file at line 1.
+        Warning: Command output exceeded window, saved command to a file {command_file_name}. Use 'open {command_file_name}' to view the full output.
 
 
     """
@@ -136,17 +137,34 @@ class SimpleSummarizer(SummarizeFunction):
 
     def __call__(self, input: str, observation: str, env: SWEEnv, model: BaseModel) -> tuple[str, APIStats]:
         try:
+            # More robust blocking: check if the command (first word) is in block list
+            command_name = input.strip().split()[0] if input.strip() else ""
             if (
-                any(input.startswith(s) for s in self.block_list_input)
+                command_name in self.block_list_input
                 or len(observation.splitlines()) <= self._window_length
             ):
                 return observation, APIStats()
+            
             self.logger.debug(f"Summarizing current observation for input {input}")
-            command_file_name = "/output/" + self._slugify_action(input)
+            # Use unique filenames with timestamp to avoid any collision issues
+            timestamp = str(int(time.time() * 1000))  # milliseconds for uniqueness  
+            command_slug = self._slugify_action(input)
+            command_file_name = f"/output/{command_slug}_{timestamp}"
+            
+            # For all non-blocked commands, use the standard behavior
             self._upload_file_to_container(observation, command_file_name, env)
-            return textwrap.dedent(self._warning_message.format(command_file_name=command_file_name)) + env.communicate(
-                f"open {command_file_name}"
-            ), APIStats()
+            
+            # Create the warning message but don't open the file to avoid changing CURRENT_FILE
+            warning_message = textwrap.dedent(self._warning_message.format(command_file_name=command_file_name))
+            
+            # Instead of opening the file (which would change CURRENT_FILE), just show a preview
+            preview_lines = observation.splitlines()[:10]  # Show first 10 lines as preview
+            preview = "\n".join(preview_lines)
+            if len(observation.splitlines()) > 10:
+                preview += f"\n\n... ({len(observation.splitlines()) - 10} more lines in {command_file_name})"
+            
+            return warning_message + preview, APIStats()
+                
         except Exception:
             self.logger.warning(
                 f"Unhandled exception occurred when trying to summarize observation for input {input}: {traceback.format_exc()}"
@@ -216,8 +234,10 @@ class LMSummarizer(SummarizeFunction):
 
     def __call__(self, input: str, observation: str, env: SWEEnv, model: BaseModel) -> tuple[str, APIStats]:
         try:
+            # More robust blocking: check if the command (first word) is in block list
+            command_name = input.strip().split()[0] if input.strip() else ""
             if (
-                any(input.startswith(s) for s in self.block_list_input)
+                command_name in self.block_list_input
                 or len(observation.splitlines()) <= self._window_length
             ):
                 return observation, APIStats()
@@ -227,19 +247,25 @@ class LMSummarizer(SummarizeFunction):
                 self.logger.warning("Observation is too long for LMSummarizer, using SimpleSummarizer instead")
                 return self._simple_summarizer(input, observation, env, model)
             self.logger.debug(f"Summarizing current observation for input {input}")
-            command_file_name = "/output/" + self._slugify_action(input)
+            # Use unique filenames with timestamp to avoid any collision issues
+            timestamp = str(int(time.time() * 1000))  # milliseconds for uniqueness  
+            command_slug = self._slugify_action(input)
+            command_file_name = f"/output/{command_slug}_{timestamp}"
+            
+            # For all non-blocked commands, use the standard behavior
             self._upload_file_to_container(observation, command_file_name, env)
+            summarization_content = observation
+            
             self.history.append(
                 {
                     "role": "user",
                     "content": self.instance_template.format(
-                        **self.instance_args, **self.system_args, command=input, observation=observation
+                        **self.instance_args, **self.system_args, command=input, observation=summarization_content
                     ),
                     "agent": self.name,
                 }
             )
             self.logger.debug(f"Summarizer history")
-            exit()
             response = model.query(history=self.history)
             stats = model.stats
             model.reset_stats(APIStats())

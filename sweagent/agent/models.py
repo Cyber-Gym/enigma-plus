@@ -332,14 +332,74 @@ class OpenAIModel(BaseModel):
             "cost_per_output_token": 2.8e-07,
         },
         "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0610": {
-            "max_context": 128_000,
+            "max_context": 32_768,
             "cost_per_input_token": 1.4e-07,
             "cost_per_output_token": 2.8e-07,
         },
         "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0611_ablate": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/agent-qwen3-r1-0616": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/efs/people/zhuoterq/agent-qwen3-0617_llm_filter": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/agent-qwen3_llm_filter_above_40_0619": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/agent-qwen3_llm_filter_less_than_40_0619": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/agent-qwen3_llm_filter_uniform_0619": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/agent_qwen3_uniform_1e": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/agent_qwen3_uniform_3e": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/dhantian/public_models/DeepSeek-R1-0528/": {
             "max_context": 128_000,
             "cost_per_input_token": 1.4e-07,
             "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/dhantian/public_models/deepseek-ai_DeepSeek-V3-0324": {
+            "max_context": 128_000,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/qwen3-agent-v3-0629": {
+            "max_context": 32_768,
+            "cost_per_input_token": 1.4e-07,
+            "cost_per_output_token": 2.8e-07,
+        },
+        "/mnt/people/zhuoterq/qwen3-agnet_14b_0705": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
+        "/mnt/people/zhuoterq/qwen3-agnet_8b_0705": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
         },
     }
 
@@ -369,6 +429,18 @@ class OpenAIModel(BaseModel):
         "agent-qwen3-step619_0601": "/mnt/efs/people/zhuoterq/agent-qwen3-step619_0601",
         "agent-qwen3-2e_0610": "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0610",
         "agent-qwen3-2e_0611_ablate": "/mnt/efs/people/zhuoterq/agent-qwen3-2e_0611_ablate",
+        "agent-qwen3-r1-0616": "/mnt/people/zhuoterq/agent-qwen3-r1-0616",
+        "agent-qwen3-0617_llm_filter": "/mnt/efs/people/zhuoterq/agent-qwen3-0617_llm_filter",
+        "agent-qwen3_llm_filter_above_40_0619": "/mnt/people/zhuoterq/agent-qwen3_llm_filter_above_40_0619",
+        "agent-qwen3_llm_filter_less_than_40_0619": "/mnt/people/zhuoterq/agent-qwen3_llm_filter_less_than_40_0619",
+        "agent-qwen3_llm_filter_uniform_0619": "/mnt/people/zhuoterq/agent-qwen3_llm_filter_uniform_0619",
+        "agent_qwen3_uniform_1e": "/mnt/people/zhuoterq/agent_qwen3_uniform_1e",
+        "agent_qwen3_uniform_3e": "/mnt/people/zhuoterq/agent_qwen3_uniform_3e",
+        "deepseek-r1-0528": "/mnt/people/dhantian/public_models/DeepSeek-R1-0528/",
+        "deepseek-v3-0324": "/mnt/people/dhantian/public_models/deepseek-ai_DeepSeek-V3-0324",
+        "qwen3-agent-v3-0629": "/mnt/people/zhuoterq/qwen3-agent-v3-0629",
+        "qwen3-agnet_14b_0705": "/mnt/people/zhuoterq/qwen3-agnet_14b_0705",
+        "qwen3-agnet_8b_0705": "/mnt/people/zhuoterq/qwen3-agnet_8b_0705"
     }
 
     def __init__(self, args: ModelArguments, commands: list[Command]):
@@ -378,6 +450,8 @@ class OpenAIModel(BaseModel):
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         self._setup_client()
+        # Track all previous responses to detect duplicates
+        self.previous_responses = []
 
     def _setup_client(self):
         if self.args.model_name.startswith("azure"):
@@ -421,27 +495,54 @@ class OpenAIModel(BaseModel):
         """
         Query the OpenAI API with the given `history` and return the response.
         """
-        try:
-            # Perform OpenAI API call
-            response = self.client.chat.completions.create(
-                messages=self.history_to_messages(history),
-                model=self.api_model,
-                temperature=self.args.temperature,
-                top_p=self.args.top_p,
-            )
-
-        except BadRequestError as e:
-            logger.exception("BadRequestError")
-            if "context window" in str(e) or getattr(e, "error", {}).get("code") == "context_length_exceeded":
-                msg = f"Context window ({self.model_metadata['max_context']} tokens) exceeded"
-                raise ContextWindowExceededError(msg) from e
-            else:
-                raise e
-        # Calculate + update costs, return response
+        max_resample_attempts = 10
+        resample_count = 0
+        
+        while resample_count < max_resample_attempts:
+            try:
+                # Perform OpenAI API call
+                response = self.client.chat.completions.create(
+                    messages=self.history_to_messages(history),
+                    model=self.api_model,
+                    temperature=self.args.temperature,
+                    top_p=self.args.top_p,
+                )
+                break
+            except BadRequestError as e:
+                logger.exception("BadRequestError")
+                if "context window" in str(e) or getattr(e, "error", {}).get("code") == "context_length_exceeded":
+                    msg = f"Context window ({self.model_metadata['max_context']} tokens) exceeded"
+                    raise ContextWindowExceededError(msg) from e
+                else:
+                    raise e
+            
+        # Calculate + update costs, get response
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
         self.update_stats(input_tokens, output_tokens)
-        return clean_result(response.choices[0].message.content)
+        current_response = clean_result(response.choices[0].message.content)
+        
+            # # Check if this response matches any previous response
+            # if current_response.strip() in self.previous_responses:
+            #     resample_count += 1
+            #     # Print colored warning message
+            #     print(f"\033[93m⚠️  WARNING: Duplicate response detected (attempt {resample_count}/{max_resample_attempts})\033[0m")
+            #     print(f"\033[91m   Response matches a previous response. Resampling...\033[0m")
+                
+            #     if resample_count >= max_resample_attempts:
+            #         print(f"\033[91m❌ Max resample attempts reached. Returning duplicate response.\033[0m")
+            #         break
+                    
+            #     continue
+            # else:
+            #     # Different response found, break the loop
+            #     if resample_count > 0:
+            #         print(f"\033[92m✅ Successfully obtained unique response after {resample_count} resamples.\033[0m")
+            #     break
+        
+        # Store this response for future comparison
+        self.previous_responses.append(current_response.strip())
+        return current_response
 
 
 class DeepSeekModel(OpenAIModel):
@@ -603,59 +704,17 @@ class AnthropicModel(BaseModel):
 
 class BedrockModel(BaseModel):
     MODELS = {
-        "anthropic.claude-instant-v1": {
-            "max_context": 100_000,
-            "max_tokens_to_sample": 4096,
-            "cost_per_input_token": 8e-07,
-            "cost_per_output_token": 2.4e-06,
-        },
-        "anthropic.claude-v2": {
-            "max_context": 100_000,
-            "max_tokens_to_sample": 4096,
-            "cost_per_input_token": 8e-06,
-            "cost_per_output_token": 2.4e-05,
-        },
-        "anthropic.claude-v2:1": {
-            "max_context": 100_000,
-            "max_tokens": 4096,
-            "cost_per_input_token": 8e-06,
-            "cost_per_output_token": 2.4e-05,
-        },
-        "anthropic.claude-3-opus-20240229-v1:0": {
-            "max_context": 200_000,
-            "max_tokens": 4096,
-            "cost_per_input_token": 1.5e-05,
-            "cost_per_output_token": 7.5e-05,
-        },
-        "anthropic.claude-3-sonnet-20240229-v1:0": {
-            "max_context": 200_000,
-            "max_tokens": 4096,
-            "cost_per_input_token": 3e-06,
-            "cost_per_output_token": 1.5e-05,
-        },
-        "anthropic.claude-3-haiku-20240307-v1:0": {
-            "max_context": 200_000,
-            "max_tokens": 4096,
-            "cost_per_input_token": 2.5e-07,
-            "cost_per_output_token": 1.25e-06,
-        },
         "us.anthropic.claude-3-5-sonnet-20241022-v2:0": {
             "max_context": 200_000,
             "max_tokens": 4096,
             "cost_per_input_token": 3e-06,
-            "cost_per_output_token": 1.5e-05,
+            "cost_per_output_token": 15e-06,
         },
         "us.anthropic.claude-3-7-sonnet-20250219-v1:0": {
             "max_context": 200_000,
             "max_tokens": 4096,
             "cost_per_input_token": 3e-06,
-            "cost_per_output_token": 1.5e-05,
-        },
-        "us.deepseek.r1-v1:0": {
-            "max_context": 128_000,
-            "max_tokens": 4096,
-            "cost_per_input_token": 1.4e-07,
-            "cost_per_output_token": 2.8e-07,
+            "cost_per_output_token": 15e-06,
         },
     }
 
