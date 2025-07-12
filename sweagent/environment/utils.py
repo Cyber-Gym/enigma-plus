@@ -301,73 +301,61 @@ def create_dynamic_docker_compose(
                 service_config['container_name'] = new_service_name
                 logger.debug(f"Added container name: {new_service_name}")
             
-            # Update port mappings
-            if 'ports' in service_config:
-                new_ports = []
-                for port_spec in service_config['ports']:
-                    if isinstance(port_spec, str) and ":" in port_spec:
-                        # Handle "external:internal" format
-                        external_part, internal_part = port_spec.split(":", 1)
-                        internal_port = internal_part.split("/")[0]  # Remove protocol if present
-                        
-                        # Try service-specific key first, then fall back to simple internal port key
-                        service_key = f"{service_name}:{internal_port}"
-                        if service_key in port_mappings:
-                            new_port_spec = f"{port_mappings[service_key]}:{internal_part}"
-                            new_ports.append(new_port_spec)
-                            logger.debug(f"Mapped port {port_spec} -> {new_port_spec} (using service-specific key)")
-                        else:
-                            new_ports.append(port_spec)
-                            logger.debug(f"No mapping found for {service_name}:{internal_port}, keeping original: {port_spec}")
-                    elif isinstance(port_spec, int):
-                        # Just internal port specified
-                        internal_port_str = str(port_spec)
-                        
-                        # Try service-specific key first, then fall back to simple internal port key
-                        service_key = f"{service_name}:{internal_port_str}"
-                        if service_key in port_mappings:
-                            new_port_spec = f"{port_mappings[service_key]}:{port_spec}"
-                            new_ports.append(new_port_spec)
-                            logger.debug(f"Mapped port {port_spec} -> {new_port_spec} (using service-specific key)")
-                        else:
-                            new_ports.append(port_spec)
-                            logger.debug(f"No mapping found for {service_name}:{internal_port_str}, keeping original: {port_spec}")
-                    else:
-                        new_ports.append(port_spec)
-                service_config['ports'] = new_ports
+            # CRITICAL FIX: Add restart policy for automatic recovery from crashes
+            # This ensures that CTF servers automatically restart when they crash
+            # This is especially important for CTF challenges where services might crash due to exploits
+            if 'restart' not in service_config:
+                # Add restart policy if not already specified
+                service_config['restart'] = 'always'  # Restart
+                logger.debug(f"Added restart policy 'always' to service {new_service_name}")
             else:
-                # CRITICAL FIX: Only add port mappings to services that should expose ports
-                # Don't add ports to utility services (iptables, monitoring, etc.)
+                logger.debug(f"Service {new_service_name} already has restart policy: {service_config['restart']}")
+            
+            # Update port mappings if dynamic ports are enabled
+            if 'ports' in service_config and port_mappings:
+                # Preserve original port mappings for reference
+                original_ports = service_config['ports'].copy()
+                updated_ports = []
                 
-                # Check if this service should get port mappings based on its characteristics
-                should_add_ports = False
+                for port_config in service_config['ports']:
+                    if isinstance(port_config, str) and ':' in port_config:
+                        external_port, internal_port = port_config.split(':', 1)
+                        
+                        # Look for port mapping using service-specific key first
+                        mapping_key = f"{service_name}:{internal_port}"
+                        if mapping_key in port_mappings:
+                            new_external_port = port_mappings[mapping_key]
+                            updated_ports.append(f"{new_external_port}:{internal_port}")
+                            logger.debug(f"Updated port mapping for {new_service_name}: {external_port}:{internal_port} -> {new_external_port}:{internal_port}")
+                        elif internal_port in port_mappings:
+                            # Fallback to simple internal port key for backward compatibility
+                            new_external_port = port_mappings[internal_port]
+                            updated_ports.append(f"{new_external_port}:{internal_port}")
+                            logger.debug(f"Updated port mapping for {new_service_name}: {external_port}:{internal_port} -> {new_external_port}:{internal_port}")
+                        else:
+                            updated_ports.append(port_config)
+                            logger.debug(f"No port mapping found for {new_service_name}:{internal_port}, keeping original: {port_config}")
+                    elif isinstance(port_config, int):
+                        # Handle integer port (just internal port specified)
+                        internal_port = str(port_config)
+                        mapping_key = f"{service_name}:{internal_port}"
+                        if mapping_key in port_mappings:
+                            new_external_port = port_mappings[mapping_key]
+                            updated_ports.append(f"{new_external_port}:{internal_port}")
+                            logger.debug(f"Updated port mapping for {new_service_name}: {port_config} -> {new_external_port}:{internal_port}")
+                        elif internal_port in port_mappings:
+                            new_external_port = port_mappings[internal_port]
+                            updated_ports.append(f"{new_external_port}:{internal_port}")
+                            logger.debug(f"Updated port mapping for {new_service_name}: {port_config} -> {new_external_port}:{internal_port}")
+                        else:
+                            updated_ports.append(port_config)
+                            logger.debug(f"No port mapping found for {new_service_name}:{internal_port}, keeping original: {port_config}")
+                    else:
+                        # Keep other port configurations as-is
+                        updated_ports.append(port_config)
                 
-                # Only add ports if this looks like a main application service
-                if (
-                    # Has a healthcheck (likely a web service)
-                    'healthcheck' in service_config or
-                    # Service name suggests it's a main service (not utility)
-                    any(keyword in service_name.lower() for keyword in ['server', 'web', 'app', 'api', 'service']) and
-                    not any(keyword in service_name.lower() for keyword in ['iptables', 'proxy', 'monitor', 'sidecar', 'init'])
-                ):
-                    should_add_ports = True
-                    logger.debug(f"Service {service_name} identified as main application service - will add port mappings")
-                else:
-                    logger.debug(f"Service {service_name} identified as utility service - skipping port mappings")
-                
-                if should_add_ports:
-                    # Service doesn't have ports, but add any mapped challenge ports for main services only
-                    new_ports = []
-                    # Look for service-specific mappings first
-                    for mapping_key, external_port in port_mappings.items():
-                        if ":" in mapping_key:
-                            map_service, internal_port_str = mapping_key.split(":", 1)
-                            if map_service == service_name:
-                                new_port_spec = f"{external_port}:{internal_port_str}"
-                                new_ports.append(new_port_spec)
-                                logger.debug(f"Added service-specific port mapping: {new_port_spec}")
-                    if new_ports:
-                        service_config['ports'] = new_ports
+                service_config['ports'] = updated_ports
+                logger.debug(f"Updated ports for {new_service_name}: {original_ports} -> {updated_ports}")
             
             # Store service with new name
             new_services[new_service_name] = service_config
@@ -1358,7 +1346,7 @@ def get_docker_compose(
         # This prevents the "0/1" build hanging issue
         compose_env = os.environ.copy()
         compose_env.update({
-            'DOCKER_BUILDKIT': '0',
+            'DOCKER_BUILDKIT': '1',
             'COMPOSE_DOCKER_CLI_BUILD': '0'
         })
         

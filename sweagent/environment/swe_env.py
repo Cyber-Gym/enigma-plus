@@ -2217,8 +2217,7 @@ class SWEEnv(gym.Env):
 
             pattern = r".+?{(.+?)}"
             match = re.search(pattern, submission)
-            if match:
-                extracted_flag = match.group(1) if match else ""
+            extracted_flag = match.group(1) if match else submission
             
             if "flag" in self.challenge and self.challenge["flag"] != "pwn.college{...}":
                 solution = self.challenge["flag"]
@@ -2236,6 +2235,16 @@ class SWEEnv(gym.Env):
                 sha256_correct = hashlib.sha256(submission.encode()).hexdigest() == checker
 
             if "flag_check" in self.challenge:
+                # Ensure the flag_check script is readable and executable
+                flag_check_path = self.challenge["flag_check"]
+                try:
+                    # Make the flag_check script readable and executable
+                    os.chmod(flag_check_path, 0o755)
+                    self.logger.debug(f"Set permissions for flag_check script: {flag_check_path}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to set permissions for flag_check script {flag_check_path}: {e}")
+                    # Try to continue anyway in case the script is already executable
+                
                 raw_check_result = subprocess.run(
                     [self.challenge["flag_check"]],
                     input=submission + "\n",

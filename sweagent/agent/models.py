@@ -716,6 +716,12 @@ class BedrockModel(BaseModel):
             "cost_per_input_token": 3e-06,
             "cost_per_output_token": 15e-06,
         },
+        "us.anthropic.claude-sonnet-4-20250514-v1:0": {
+            "max_context": 200_000,
+            "max_tokens": 4096,
+            "cost_per_input_token": 3e-06,
+            "cost_per_output_token": 15e-06,
+        },
     }
 
     def __init__(self, args: ModelArguments, commands: list[Command]):
