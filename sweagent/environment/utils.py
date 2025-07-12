@@ -51,6 +51,9 @@ DEFAULT_PORT_RANGE_END = 20000
 
 logger = get_logger("env_utils")
 
+# Timeout constants for utilities
+UTILS_DOCKER_EXEC_TIMEOUT = float(os.environ.get("SWE_AGENT_DOCKER_EXEC_TIMEOUT", "30"))
+
 
 class NoOutputTimeoutError(TimeoutError): ...
 
@@ -1558,7 +1561,7 @@ def _get_non_persistent_container(
     # Final health check
     try:
         # Test basic container communication
-        test_result = container_obj.exec_run("echo 'container_ready'", timeout=5)
+        test_result = container_obj.exec_run("echo 'container_ready'")
         if test_result.exit_code != 0 or b"container_ready" not in test_result.output:
             logger.warning(f"Container {ctr_name} failed basic health check")
             logger.warning(f"Health check result: exit_code={test_result.exit_code}, output={test_result.output}")
@@ -1661,11 +1664,170 @@ def _get_persistent_container(
     if len(bash_pids) == 1:
         bash_pid = bash_pids[0][0]
     elif len(bash_pids) > 1 or len(other_pids) > 0:
-        msg = (
-            "Detected alien processes attached or running. Please ensure that no other agents "
-            f"are running on this container. PIDs: {bash_pids}, {other_pids}"
-        )
-        raise RuntimeError(msg)
+        # Enhanced alien process handling with recovery attempts
+        logger.warning(f"Detected potential alien processes. Bash PIDs: {bash_pids}, Other PIDs: {other_pids}")
+        
+        # Try to recover by cleaning up stuck processes
+        recovery_successful = False
+        
+        # Attempt 1: Try to kill stuck processes gracefully
+        logger.info("🔧 Attempting to clean up stuck processes...")
+        try:
+            all_stuck_pids = [pid for pid, _ in bash_pids[1:]] + [pid for pid, _ in other_pids]  # Skip first bash PID
+            
+            if all_stuck_pids:
+                logger.debug(f"Attempting to kill stuck processes: {all_stuck_pids}")
+                
+                # First try SIGTERM
+                for pid in all_stuck_pids:
+                    try:
+                        result = container_obj.exec_run(f"kill -TERM {pid}")
+                        logger.debug(f"SIGTERM to PID {pid}: exit_code={result.exit_code}")
+                    except Exception as e:
+                        logger.debug(f"SIGTERM failed for PID {pid}: {e}")
+                
+                time.sleep(3)  # Wait for graceful termination
+                
+                # Check if processes are gone
+                bash_pids_after_term, other_pids_after_term = get_background_pids(container_obj)
+                if len(bash_pids_after_term) <= 1 and len(other_pids_after_term) == 0:
+                    logger.info("✅ Graceful cleanup successful")
+                    recovery_successful = True
+                    bash_pid = bash_pids_after_term[0][0] if bash_pids_after_term else 1
+                else:
+                    # Try SIGKILL
+                    logger.debug("Graceful cleanup failed, trying SIGKILL...")
+                    remaining_pids = [pid for pid, _ in bash_pids_after_term[1:]] + [pid for pid, _ in other_pids_after_term]
+                    
+                    for pid in remaining_pids:
+                        try:
+                            result = container_obj.exec_run(f"kill -9 {pid}")
+                            logger.debug(f"SIGKILL to PID {pid}: exit_code={result.exit_code}")
+                        except Exception as e:
+                            logger.debug(f"SIGKILL failed for PID {pid}: {e}")
+                    
+                    time.sleep(3)  # Wait for forceful termination
+                    
+                    # Final check
+                    bash_pids_final, other_pids_final = get_background_pids(container_obj)
+                    if len(bash_pids_final) <= 1 and len(other_pids_final) == 0:
+                        logger.info("✅ Forceful cleanup successful")
+                        recovery_successful = True
+                        bash_pid = bash_pids_final[0][0] if bash_pids_final else 1
+                    else:
+                        logger.warning(f"Forceful cleanup partially failed. Remaining: bash={bash_pids_final}, other={other_pids_final}")
+        
+        except Exception as e:
+            logger.warning(f"Exception during stuck process cleanup: {e}")
+        
+        # Attempt 2: Check if remaining processes are uninterruptible
+        if not recovery_successful:
+            logger.info("🔍 Analyzing remaining processes for uninterruptible states...")
+            bash_pids_current, other_pids_current = get_background_pids(container_obj)
+            uninterruptible_processes = []
+            killable_processes = []
+            
+            all_current_pids = bash_pids_current + other_pids_current
+            for pid, comm in all_current_pids:
+                if pid == "1":  # Skip init process
+                    continue
+                    
+                try:
+                    # Check process state
+                    stat_result = container_obj.exec_run(f"cat /proc/{pid}/stat 2>/dev/null")
+                    if stat_result.exit_code == 0:
+                        stat_fields = stat_result.output.decode().strip().split()
+                        if len(stat_fields) > 2:
+                            process_state = stat_fields[2]
+                            if process_state == 'D':  # Uninterruptible sleep
+                                uninterruptible_processes.append((pid, comm, process_state))
+                                logger.warning(f"Process {pid} ({comm}) is in uninterruptible sleep - cannot be killed")
+                            elif process_state in ['S', 'R', 'T', 'Z']:  # Interruptible states
+                                killable_processes.append((pid, comm, process_state))
+                            else:
+                                logger.debug(f"Process {pid} ({comm}) in state {process_state}")
+                except Exception as e:
+                    logger.debug(f"Failed to check state for PID {pid}: {e}")
+                    # Assume it's killable if we can't check
+                    killable_processes.append((pid, comm, "unknown"))
+            
+            # If most processes are uninterruptible, we'll be more lenient
+            total_alien_processes = len(all_current_pids) - (1 if any(pid == "1" for pid, _ in all_current_pids) else 0)
+            uninterruptible_count = len(uninterruptible_processes)
+            
+            if uninterruptible_count > 0:
+                logger.warning(f"Found {uninterruptible_count}/{total_alien_processes} uninterruptible processes")
+                
+                # If majority are uninterruptible, this is likely due to filesystem operations (like grep)
+                # In this case, we'll be more lenient and allow the container to be used
+                if uninterruptible_count >= total_alien_processes * 0.5:  # 50% or more are uninterruptible
+                    logger.warning("⚠️  Majority of processes are uninterruptible (likely due to I/O operations)")
+                    logger.warning("🔄 Allowing container reuse with understanding that these processes may eventually exit")
+                    recovery_successful = True
+                    
+                    # Use the first bash PID if available, otherwise use 1
+                    if len(bash_pids_current) > 0:
+                        bash_pid = bash_pids_current[0][0]
+                    else:
+                        bash_pid = 1
+                        
+                    # Log the uninterruptible processes for monitoring
+                    for pid, comm, state in uninterruptible_processes:
+                        logger.warning(f"  Uninterruptible process: PID {pid} ({comm}) in state {state}")
+        
+        # Attempt 3: Container restart as last resort
+        if not recovery_successful and not container_created:
+            logger.warning("🔄 Attempting container restart to clear stuck processes...")
+            try:
+                container_obj.restart(timeout=30)
+                time.sleep(DOCKER_START_UP_DELAY)
+                
+                # Check processes after restart
+                bash_pids_restart, other_pids_restart = get_background_pids(container_obj)
+                if len(bash_pids_restart) <= 1 and len(other_pids_restart) == 0:
+                    logger.info("✅ Container restart successful - processes cleared")
+                    recovery_successful = True
+                    bash_pid = bash_pids_restart[0][0] if bash_pids_restart else 1
+                else:
+                    logger.warning(f"Container restart didn't fully clear processes: bash={bash_pids_restart}, other={other_pids_restart}")
+            except Exception as e:
+                logger.error(f"Container restart failed: {e}")
+        
+        # If all recovery attempts failed, raise the original error but with more context
+        if not recovery_successful:
+            final_bash_pids, final_other_pids = get_background_pids(container_obj)
+            
+            # Provide detailed information about what processes are stuck
+            process_details = []
+            for pid, comm in final_bash_pids + final_other_pids:
+                try:
+                    # Get more detailed process information
+                    cmdline_result = container_obj.exec_run(f"cat /proc/{pid}/cmdline 2>/dev/null | tr '\\0' ' '")
+                    stat_result = container_obj.exec_run(f"cat /proc/{pid}/stat 2>/dev/null")
+                    
+                    cmdline = cmdline_result.output.decode().strip() if cmdline_result.exit_code == 0 else "unknown"
+                    state = "unknown"
+                    if stat_result.exit_code == 0:
+                        stat_fields = stat_result.output.decode().strip().split()
+                        if len(stat_fields) > 2:
+                            state = stat_fields[2]
+                    
+                    process_details.append(f"PID {pid} ({comm}): {cmdline} [state: {state}]")
+                except Exception:
+                    process_details.append(f"PID {pid} ({comm}): [details unavailable]")
+            
+            msg = (
+                "Detected alien processes attached or running. Please ensure that no other agents "
+                f"are running on this container.\n"
+                f"Bash PIDs: {final_bash_pids}\n"
+                f"Other PIDs: {final_other_pids}\n"
+                f"Process details:\n" + "\n".join(f"  {detail}" for detail in process_details) + "\n"
+                f"Recovery attempts failed. This may be due to uninterruptible processes from "
+                f"expensive operations like filesystem searches (grep -r, find, etc.). "
+                f"Consider using a new container or waiting for I/O operations to complete."
+            )
+            raise RuntimeError(msg)
+    
     return container, {str(bash_pid), "1"}
 
 

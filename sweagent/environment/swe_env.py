@@ -1,3 +1,48 @@
+"""
+SWE-agent Environment Module
+
+This module provides the core environment for SWE-agent, handling communication with 
+Docker containers and managing task execution.
+
+TIMEOUT HANDLING AND STUCK EXECUTION ISSUES
+==========================================
+
+The SWE-agent environment includes comprehensive timeout handling to prevent hung executions:
+
+1. **Agent Action Timeouts**:
+   - SWE_AGENT_ACTION_TIMEOUT: Maximum time for any agent command (default: 25s)
+   - SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT: Time to wait when no output is produced (default: same as above)
+
+2. **Docker Operation Timeouts**:
+   - SWE_AGENT_DOCKER_EXEC_TIMEOUT: Timeout for Docker exec operations (default: 30s)
+   - SWE_AGENT_CONTAINER_HEALTH_CHECK_TIMEOUT: Timeout for container health checks (default: 5s)
+
+3. **Recovery Mechanisms**:
+   - SWE_AGENT_INTERRUPT_TIMEOUT: Time to wait during process interruption (default: 20s)
+   - SWE_AGENT_MAX_EXECUTION_RETRIES: Maximum retry attempts for failed commands (default: 2)
+
+Common Stuck Execution Scenarios:
+- Long-running filesystem operations (grep -r, find /, etc.)
+- Interactive programs waiting for input
+- Network operations that hang
+- Container becoming unresponsive
+- Process deadlocks
+
+Environment Variables for Timeout Configuration:
+- Set longer timeouts for complex operations: SWE_AGENT_ACTION_TIMEOUT=60
+- Enable strict timeouts for testing: SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT=10
+- Adjust Docker operation timeouts: SWE_AGENT_DOCKER_EXEC_TIMEOUT=45
+
+Usage Example:
+    export SWE_AGENT_ACTION_TIMEOUT=45
+    export SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT=20
+    export SWE_AGENT_MAX_EXECUTION_RETRIES=3
+    python run.py --config config.yaml
+
+The environment will automatically detect and handle most stuck execution scenarios
+with appropriate error messages and recovery attempts.
+"""
+
 from __future__ import annotations
 
 import datetime
@@ -77,6 +122,12 @@ PATH_TO_ENV_YML = "/root/environment.yml"
 
 # CTF server validation timeout
 CTF_SERVER_VALIDATION_TIMEOUT = float(keys_config.get("SWE_AGENT_CTF_SERVER_VALIDATION_TIMEOUT", 10))
+
+# Additional timeout configurations for stuck execution handling
+DOCKER_EXEC_TIMEOUT = float(keys_config.get("SWE_AGENT_DOCKER_EXEC_TIMEOUT", 30))
+CONTAINER_HEALTH_CHECK_TIMEOUT = float(keys_config.get("SWE_AGENT_CONTAINER_HEALTH_CHECK_TIMEOUT", 5))
+INTERRUPT_TIMEOUT = float(keys_config.get("SWE_AGENT_INTERRUPT_TIMEOUT", 20))
+MAX_EXECUTION_RETRIES = int(keys_config.get("SWE_AGENT_MAX_EXECUTION_RETRIES", 2))
 
 
 @dataclass(frozen=True)
@@ -914,15 +965,24 @@ class SWEEnv(gym.Env):
                 observation += e.args[1] if len(e.args) > 1 else ""
                 observation += self.interrupt()
                 observation += "\nEXECUTION TIMED OUT"
-                observation += (
-                    f" BECAUSE NO OUTPUT WAS PRODUCED FOR MORE THAN {AGENT_ACTION_NO_OUTPUT_TIMEOUT} SECONDS.\nPLEASE REFINE YOUR RUNNING COMMAND SO IT WILL PRODUCE OUTPUT IN THE SPECIFIED TIME FRAME."
-                    if isinstance(e, NoOutputTimeoutError)
-                    else f" BECAUSE THE COMMAND WAS RUNNING FOR MORE THAN {AGENT_ACTION_TIMEOUT} SECONDS."
-                )
+                
+                # Enhanced timeout handling with better diagnostics
+                if isinstance(e, NoOutputTimeoutError):
+                    observation += f" BECAUSE NO OUTPUT WAS PRODUCED FOR MORE THAN {AGENT_ACTION_NO_OUTPUT_TIMEOUT} SECONDS.\n"
+                    observation += "POSSIBLE CAUSES:\n"
+                    observation += "- Command is waiting for user input (use non-interactive flags)\n"
+                    observation += "- Process is stuck in I/O wait (filesystem operations)\n"
+                    observation += "- Command is running but not producing output\n"
+                    observation += "SUGGESTIONS: Use 'timeout' command, add progress indicators, or try a simpler approach."
+                else:
+                    observation += f" BECAUSE THE COMMAND WAS RUNNING FOR MORE THAN {AGENT_ACTION_TIMEOUT} SECONDS.\n"
+                    observation += self._handle_stuck_execution(action)
+                    
             except RuntimeError as e:
                 observation += e.args[1] if len(e.args) > 1 else ""
                 observation += "\nEXECUTION TIMED OUT AND INTERRUPT FAILED. RESTARTING PROCESS."
                 info["exit_status"] = "early_exit"
+                info["timeout_reason"] = "interrupt_failed"
                 self.logger.warning(f"Failed to interrupt container: {e}\nRESTARTING PROCESS.")
                 self.reset_container()
                 return observation, 0, True, info
@@ -1752,7 +1812,7 @@ class SWEEnv(gym.Env):
         """
         try:
             # Try a simple command to check if container is responsive
-            result = self.communicate("echo 'health_check'", timeout_duration=5)
+            result = self.communicate("echo 'health_check'", timeout_duration=CONTAINER_HEALTH_CHECK_TIMEOUT)
             return "health_check" in result
         except Exception as e:
             self.logger.debug(f"Container health check failed: {e}")
@@ -1971,7 +2031,7 @@ class SWEEnv(gym.Env):
                     else:
                         # No valid JSON found, return minimal state
                         try:
-                            current_dir = self.container.exec_run("pwd", workdir="/").output.decode().strip()
+                            current_dir = self._safe_exec_run("pwd", timeout_duration=5, workdir="/")
                         except:
                             current_dir = "/"
                         buffer = f'{{"open_file": "n/a", "working_dir": "{current_dir}", "interactive_session": "n/a"}}'
@@ -2183,7 +2243,12 @@ class SWEEnv(gym.Env):
             list of PIDs
         """
         assert self.container_obj is not None
-        pids = self.container_obj.exec_run("ps -eo pid,comm,ppid --no-headers").output.decode().split("\n")
+        try:
+            pids = self._safe_exec_run("ps -eo pid,comm,ppid --no-headers", timeout_duration=10).split("\n")
+        except Exception as e:
+            self.logger.warning(f"Failed to get PIDs: {e}")
+            return []
+        
         pids = [x.split() for x in pids if x]
         if not all_pids:
             # Get just the PIDs of processes that are descendants of parent_pids and not others
@@ -2529,10 +2594,13 @@ class SWEEnv(gym.Env):
         for pid, _ in pids:
             # Sending signal several times ensures that the process is dead
             for _ in range(3):
-                self.container_obj.exec_run(f"kill -9 {pid}")
+                try:
+                    self._safe_exec_run(f"kill -9 {pid}", timeout_duration=5)
+                except Exception as e:
+                    self.logger.debug(f"Failed to kill PID {pid}: {e}")
         observation = ""
         try:
-            observation += read_with_timeout(self.container, self.get_pids, 20)
+            observation += read_with_timeout(self.container, self.get_pids, INTERRUPT_TIMEOUT)
         except TimeoutError:
             pass
         try:
@@ -2751,7 +2819,7 @@ class SWEEnv(gym.Env):
                                 self.logger.warning(f"Failed to validate server recovery: {e}")
                         
                         # Even if validation failed, let the model continue - restart policy should help
-                        updated_observation = observation + "\n\n�� CTF server restart attempted. Please wait a moment and try your connection again."
+                        updated_observation = observation + "\n\n CTF server restart attempted. Please wait a moment and try your connection again."
                         return updated_observation, True
                         
                     else:
@@ -3011,3 +3079,192 @@ class SWEEnv(gym.Env):
         
         self.logger.error(f"❌ All {max_restart_attempts} restart attempts failed")
         return False
+
+    def _safe_exec_run(self, command: str, timeout_duration: int | None = None, **kwargs) -> str:
+        """
+        Safe wrapper for container.exec_run with timeout handling.
+        
+        Args:
+            command: Command to execute
+            timeout_duration: Timeout in seconds (default: uses DOCKER_EXEC_TIMEOUT)
+            **kwargs: Additional arguments for exec_run
+            
+        Returns:
+            str: Command output
+            
+        Raises:
+            RuntimeError: If command fails or times out
+        """
+        if not self.container_obj:
+            raise RuntimeError("Container object not available")
+            
+        # Use the global constant if no timeout specified
+        if timeout_duration is None:
+            timeout_duration = DOCKER_EXEC_TIMEOUT
+            
+        try:
+            # Use subprocess with docker exec for reliable timeout handling
+            # This approach actually works because subprocess.run supports timeout properly
+            
+            import subprocess
+            import shlex
+            
+            # Build docker exec command
+            container_name = self.container_obj.name
+            if isinstance(command, str):
+                # If command is a string, we need to properly handle it
+                docker_cmd = ["docker", "exec", container_name, "bash", "-c", command]
+            else:
+                # If command is already a list
+                docker_cmd = ["docker", "exec", container_name] + command
+            
+            start_time = time.time()
+            
+            try:
+                # Use subprocess.run with timeout - this actually works!
+                result = subprocess.run(
+                    docker_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_duration
+                )
+                
+                elapsed = time.time() - start_time
+                
+                # Log successful execution
+                self.logger.debug(f"Docker exec completed in {elapsed:.2f}s: {command}")
+                
+                # Return stdout if available, otherwise stderr
+                if result.stdout:
+                    return result.stdout.strip()
+                elif result.stderr:
+                    return result.stderr.strip()
+                else:
+                    return ""
+                    
+            except subprocess.TimeoutExpired as e:
+                elapsed = time.time() - start_time
+                self.logger.warning(f"Docker exec timed out after {elapsed:.1f}s: {command}")
+                
+                # Return any partial output if available
+                partial_output = ""
+                if e.stdout:
+                    partial_output += e.stdout.strip()
+                if e.stderr:
+                    if partial_output:
+                        partial_output += "\n"
+                    partial_output += e.stderr.strip()
+                
+                error_msg = f"Docker exec_run timed out after {timeout_duration}s: {command}"
+                if partial_output:
+                    error_msg += f"\nPartial output: {partial_output[:200]}..."
+                
+                raise RuntimeError(error_msg)
+                
+            except subprocess.CalledProcessError as e:
+                # Command failed but didn't timeout
+                self.logger.debug(f"Docker exec failed with exit code {e.returncode}: {command}")
+                
+                # For most cases, we still want to return the output even if exit code != 0
+                # because many commands (like ps, ls) might have non-zero exit codes but still produce useful output
+                if e.stdout:
+                    return e.stdout.strip()
+                elif e.stderr:
+                    return e.stderr.strip()
+                else:
+                    raise RuntimeError(f"Docker exec_run failed with exit code {e.returncode}: {command}")
+                    
+        except RuntimeError:
+            # Re-raise our timeout/failure errors as-is
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Docker exec_run failed: {e}")
+
+    def _safe_communicate_with_timeout(self, command: str, timeout_duration: int = 25, max_retries: int = MAX_EXECUTION_RETRIES) -> str:
+        """
+        Enhanced communicate method with better timeout handling and retry logic.
+        
+        Args:
+            command: Command to execute
+            timeout_duration: Timeout in seconds
+            max_retries: Maximum number of retry attempts (default: MAX_EXECUTION_RETRIES)
+            
+        Returns:
+            str: Command output
+            
+        Raises:
+            RuntimeError: If communication fails after retries
+        """
+        for attempt in range(max_retries):
+            try:
+                # Use shorter timeout for each attempt
+                adjusted_timeout = min(timeout_duration, 60)  # Cap at 60 seconds per attempt
+                
+                result = self.communicate(
+                    input=command,
+                    timeout_duration=adjusted_timeout,
+                    no_output_timeout_duration=adjusted_timeout,
+                )
+                return result
+                
+            except TimeoutError as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(f"Command timed out on attempt {attempt + 1}/{max_retries}: {command[:50]}...")
+                    
+                    # Try to interrupt stuck processes
+                    try:
+                        self.interrupt()
+                    except Exception as interrupt_error:
+                        self.logger.warning(f"Failed to interrupt stuck processes: {interrupt_error}")
+                    
+                    # Wait before retry
+                    time.sleep(2)
+                    continue
+                else:
+                    # Final attempt failed
+                    raise RuntimeError(f"Command timed out after {max_retries} attempts: {command[:50]}...")
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(f"Command failed on attempt {attempt + 1}/{max_retries}: {e}")
+                    time.sleep(1)
+                    continue
+                else:
+                    raise RuntimeError(f"Command failed after {max_retries} attempts: {e}")
+        
+        raise RuntimeError(f"All {max_retries} attempts failed for command: {command[:50]}...")
+
+    def _handle_stuck_execution(self, action: str) -> str:
+        """
+        Handle cases where agent execution appears to be stuck.
+        
+        Args:
+            action: The action that may be stuck
+            
+        Returns:
+            str: Error message explaining the timeout
+        """
+        self.logger.warning(f"Execution appears stuck for action: {action[:100]}...")
+        
+        # Try to diagnose what's causing the hang
+        try:
+            # Check if container is still responsive
+            if not self._validate_container_health():
+                return "CONTAINER UNRESPONSIVE: The container has stopped responding. Process will be restarted."
+            
+            # Check for stuck processes
+            pids = self.get_pids()
+            if len(pids) > 10:  # Unusually high number of processes
+                return f"HIGH PROCESS COUNT: {len(pids)} processes detected. Some processes may be stuck. Consider using 'pkill' to clean up."
+            
+            # Check for common stuck patterns
+            if any(pattern in action.lower() for pattern in ['grep -r', 'find /', 'search', 'locate']):
+                return "LONG OPERATION DETECTED: This appears to be a filesystem search operation. These can take a very long time. Consider using more specific search terms or paths."
+            
+            if any(pattern in action.lower() for pattern in ['python', 'node', 'java', 'compile']):
+                return "LONG COMPUTATION DETECTED: This appears to be running a program or compilation. These operations can take time. Consider adding timeout handling or progress indicators."
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to diagnose stuck execution: {e}")
+        
+        return "EXECUTION TIMEOUT: The command took too long to complete. Please try a simpler or more specific command."

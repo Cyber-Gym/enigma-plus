@@ -852,7 +852,7 @@ def deepseek_query(model: BedrockModel, history: list[dict[str, str]]) -> str:
             # Skip reasoning content for now, but could be included if needed
             continue
         else:
-            response_text = content["text"]
+            response_text = content["text"].split("(Open file:")[0].strip()
             break
 
     # Calculate token usage for cost tracking
@@ -966,10 +966,12 @@ def anthropic_query(model: AnthropicModel | BedrockModel, history: list[dict[str
         top_p=model.args.top_p,
         system=system_message,
     )
-
     # Calculate + update costs, return response
     model.update_stats(response.usage.input_tokens, response.usage.output_tokens)
-    return "\n".join([x.text for x in response.content])
+    response_text = "\n".join([x.text for x in response.content]).split("(Open file:")[0].strip()
+    print(messages)
+    print(response_text)
+    return response_text
 
 
 class OllamaModel(BaseModel):
