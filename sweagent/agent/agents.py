@@ -103,7 +103,23 @@ class AgentConfig(FrozenSerializable):
     state_command: Command = Command(
         name="state",
         code="""state() {
-            echo '{"working_dir": "'$(realpath --relative-to=$ROOT/.. $PWD)'"}';
+            # More robust state command that doesn't depend on $ROOT
+            local current_dir=$(pwd)
+            local relative_dir="."
+            
+            # Try to get relative path from repository root if possible
+            if [[ -n "$ROOT" ]] && [[ -d "$ROOT" ]]; then
+                # If ROOT is set and exists, use it
+                relative_dir=$(realpath --relative-to="$ROOT/.." "$current_dir" 2>/dev/null || echo ".")
+            elif [[ -d ".git" ]]; then
+                # If we're in a git repository, use git root
+                local git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+                if [[ -n "$git_root" ]]; then
+                    relative_dir=$(realpath --relative-to="$git_root/.." "$current_dir" 2>/dev/null || echo ".")
+                fi
+            fi
+            
+            echo '{"working_dir": "'$relative_dir'"}';
         };""",
     )
     _commands: list[Command] = field(default_factory=list)
@@ -659,21 +675,49 @@ class Agent:
         """
         assert self.config is not None  # mypy
         try:
-            # Try to extract JSON from the state string in case there are shell errors before the JSON
-            # Look for the first '{' and last '}' to extract the JSON part
-            if state and '{' in state:
-                start_idx = state.find('{')
-                end_idx = state.rfind('}')
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    json_part = state[start_idx:end_idx + 1]
-                    state_vars = json.loads(json_part)
-                else:
-                    state_vars = json.loads(state)
+            # Handle empty state by providing a default state_vars
+            if not state or not state.strip():
+                # If state is empty or only whitespace, provide default state
+                state_vars = {"working_dir": "."}
             else:
-                state_vars = json.loads(state)
+                # Check if state looks like shell commands instead of JSON
+                if ("EXITSTATUS" in state and "PROCESS-DONE" in state) or not state.strip().startswith('{'):
+                    # This is likely shell command output instead of JSON
+                    self.logger.warning(f"State appears to be shell commands instead of JSON: {state[:100]}...")
+                    
+                    # Try to extract any JSON that might be embedded
+                    if '{' in state and '}' in state:
+                        start_idx = state.find('{')
+                        end_idx = state.rfind('}')
+                        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                            json_part = state[start_idx:end_idx + 1]
+                            try:
+                                state_vars = json.loads(json_part)
+                            except json.JSONDecodeError:
+                                state_vars = {"working_dir": "."}
+                        else:
+                            state_vars = {"working_dir": "."}
+                    else:
+                        state_vars = {"working_dir": "."}
+                else:
+                    # Try to extract JSON from the state string in case there are shell errors before the JSON
+                    # Look for the first '{' and last '}' to extract the JSON part
+                    if state and '{' in state:
+                        start_idx = state.find('{')
+                        end_idx = state.rfind('}')
+                        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                            json_part = state[start_idx:end_idx + 1]
+                            state_vars = json.loads(json_part)
+                        else:
+                            state_vars = json.loads(state)
+                    else:
+                        state_vars = json.loads(state)
         except json.JSONDecodeError as e:
-            msg = f"State {state!r} is not valid json. This is an internal error, please report it."
-            raise ValueError(msg) from e
+            # If JSON parsing fails, provide a detailed error message and fallback
+            self.logger.warning(f"Failed to parse state as JSON: {e}")
+            self.logger.warning(f"State content: {state[:200]}...")
+            state_vars = {"working_dir": "."}
+            # Don't raise error - use fallback state instead
 
         templates: list[str] = []
         # Determine observation template based on what prior observation was
@@ -850,15 +894,34 @@ class Agent:
             [f"{k}={v}" for k, v in env_variables.items()]
         )
         commands = "\n".join(commands_to_execute)
+        
+        # Log the state command setup for debugging
+        self.logger.debug(f"Setting up state command in container: {self.config.state_command.name}")
+        self.logger.debug(f"State command code: {self.config.state_command.code}")
+        
         try:
             output = env.communicate(commands)
             if env.returncode != 0:
                 msg = f"Nonzero return code: {env.returncode}\nOutput: {output}"
+                self.logger.error(f"Failed to set up environment variables and state command: {msg}")
                 raise RuntimeError(msg)
+            else:
+                self.logger.debug("Environment variables and state command setup completed successfully")
+                
+                # Test if the state command is properly defined
+                try:
+                    test_output = env.communicate("type state")
+                    if "state is a function" in test_output or "state ()" in test_output:
+                        self.logger.debug("State command successfully defined as a function")
+                    else:
+                        self.logger.warning(f"State command may not be properly defined: {test_output}")
+                except Exception as test_e:
+                    self.logger.debug(f"Could not test state command definition: {test_e}")
+                    
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            self.logger.warning(f"Failed to set environment variables: {traceback.format_exc()}")
+            self.logger.error(f"Failed to set environment variables: {traceback.format_exc()}")
             raise e
         command_files = list()
         for file in self.config.command_files:
@@ -987,7 +1050,35 @@ class Agent:
             hook.on_step_start()
 
         # fixme: This will probably fail if the state command is not set
-        state = self._env.communicate(self.state_command) if self.state_command else None
+        if self.state_command:
+            try:
+                state = self._env.communicate(self.state_command)
+                # Log if state command returns empty for debugging
+                if not state or not state.strip():
+                    self.logger.warning("State command returned empty output. This may indicate an issue with environment setup.")
+                    # Provide minimal fallback state
+                    state = '{"working_dir": "."}'
+                elif not state.strip().startswith('{'):
+                    # If state doesn't start with JSON, it means the command failed
+                    self.logger.warning(f"State command returned non-JSON output: {state[:100]}...")
+                    self.logger.warning("This likely means the state function is not defined in the shell environment.")
+                    # Try to re-initialize the state command
+                    try:
+                        self.logger.info("Attempting to re-initialize state command...")
+                        self.set_environment_vars(self._env, self.config.env_variables)
+                        # Retry the state command
+                        state = self._env.communicate(self.state_command)
+                        if not state.strip().startswith('{'):
+                            # Still failed, use fallback
+                            state = '{"working_dir": "."}'
+                    except Exception as e:
+                        self.logger.warning(f"Failed to re-initialize state command: {e}")
+                        state = '{"working_dir": "."}'
+            except Exception as e:
+                self.logger.warning(f"Failed to execute state command: {e}")
+                state = '{"working_dir": "."}'
+        else:
+            state = None
         thought, action, output = self.forward(observation, self._env.get_available_actions(), state)
         for hook in self.hooks:
             hook.on_actions_generated(thought=thought, action=action, output=output)
@@ -1048,7 +1139,7 @@ class Agent:
             init_model_stats: Initial model stats to use for the run.
 
         Returns:
-            If return_type is "info_trajectory", returns a tuple of
+            If return_type is "info", returns a tuple of
             the info dictionary and the trajectory (list of dictionaries).
         """
         assert env.record is not None

@@ -694,7 +694,9 @@ def read_with_timeout_experimental(
             if data:
                 end_time_no_output = time.time() + no_output_timeout_duration
                 buffer += data
-                if PROCESS_DONE_MARKER_START in buffer.decode("utf-8", errors="backslashreplace").replace("\r\n", "\n"):
+                # Check for process done marker in the decoded buffer
+                decoded_check = buffer.decode("utf-8", errors="backslashreplace").replace("\r\n", "\n")
+                if PROCESS_DONE_MARKER_START in decoded_check:
                     process_done = True
                     break
         time.sleep(0.01)  # Prevents CPU hogging
@@ -716,12 +718,57 @@ def read_with_timeout_experimental(
             raise NoOutputTimeoutError(msg, body)
 
     _check_for_too_many_non_unicode_bytes(buffer=buffer)
+    
+    # More robust process done marker extraction
     _results = PROCESS_DONE_REGEX.search(decoded)
     if _results is None:
-        msg = f"Could not find process done marker in last line: {decoded=}, {body=}"
-        raise ValueError(msg)
-    exit_code = _results.group(1)
-    return body.replace(f"{PROCESS_DONE_MARKER_START}{exit_code}{PROCESS_DONE_MARKER_END}", ""), exit_code
+        # Try to find the marker with more flexible matching
+        # Look for lines that contain the start marker
+        lines = decoded.splitlines()
+        exit_code = None
+        
+        for line in lines:
+            if PROCESS_DONE_MARKER_START in line:
+                # Try to extract exit code from this line
+                # Handle cases where the line might be malformed
+                if PROCESS_DONE_MARKER_END in line:
+                    # Standard format: ///PROCESS-DONE:exit_code:PROCESS-DONE///
+                    try:
+                        start_idx = line.find(PROCESS_DONE_MARKER_START) + len(PROCESS_DONE_MARKER_START)
+                        end_idx = line.find(PROCESS_DONE_MARKER_END)
+                        if start_idx > 0 and end_idx > start_idx:
+                            exit_code = line[start_idx:end_idx]
+                            break
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: look for ///PROCESS-DONE:exit_code (without end marker)
+                    try:
+                        start_idx = line.find(PROCESS_DONE_MARKER_START) + len(PROCESS_DONE_MARKER_START)
+                        remainder = line[start_idx:]
+                        # Extract everything until whitespace or end of line
+                        exit_code = remainder.split()[0] if remainder.split() else "999"
+                        break
+                    except Exception:
+                        pass
+        
+        if exit_code is None:
+            # Last resort: check if buffer contains shell variable expansion
+            if "$EXITSTATUS" in decoded:
+                exit_code = "$EXITSTATUS"
+            else:
+                # Complete fallback
+                msg = f"Could not find process done marker in last line: {decoded=}, {body=}"
+                raise ValueError(msg, body)
+    else:
+        exit_code = _results.group(1)
+    
+    # Clean up the body by removing the process done marker line
+    if exit_code and exit_code != "$EXITSTATUS":
+        marker_line = f"{PROCESS_DONE_MARKER_START}{exit_code}{PROCESS_DONE_MARKER_END}"
+        body = body.replace(marker_line, "")
+    
+    return body, exit_code
 
 
 def read_session_with_timeout(

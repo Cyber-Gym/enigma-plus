@@ -36,6 +36,8 @@ def clean_result(result):
         content = " ".join(result.split("</think>")[1:])
     else:
         content = result
+    content = content.split("<|im_end|>")[0]
+    
     # print(f"Content: {result}")
     # exit()
     # # Now, remove all <|...|> patterns including Unicode variants
@@ -53,6 +55,7 @@ def clean_result(result):
             content = re.sub(pattern, "", content, flags=re.DOTALL)
 
     content = content.replace("<｜tool▁call▁begin｜>", "").replace("<｜tool▁call▁end｜>", "").replace("<｜tool▁calls▁begin｜>", "").replace("<｜tool▁calls▁end｜>", "")
+    
     return content.strip()
 
 @dataclass(frozen=True)
@@ -286,17 +289,17 @@ class OpenAIModel(BaseModel):
             "cost_per_input_token": 1.4e-07,
             "cost_per_output_token": 2.8e-07,
         },
-        "Qwen/Qwen2.5-7B-Instruct": {
+        "/mnt/people/dhantian/public_models/Qwen_Qwen2.5-7B-Instruct": {
             "max_context": 128_000,
             "cost_per_input_token": 1.4e-07,
             "cost_per_output_token": 2.8e-07,
         },
-        "Qwen/Qwen2.5-14B-Instruct": {
+        "/mnt/people/dhantian/public_models/Qwen_Qwen2.5-14B-Instruct": {
             "max_context": 128_000,
             "cost_per_input_token": 1.4e-07,
             "cost_per_output_token": 2.8e-07,
         },
-        "Qwen/Qwen2.5-32B-Instruct": {
+        "/mnt/people/dhantian/public_models/Qwen_Qwen2.5-32B-Instruct": {
             "max_context": 128_000,
             "cost_per_input_token": 1.4e-07,
             "cost_per_output_token": 2.8e-07,
@@ -401,6 +404,36 @@ class OpenAIModel(BaseModel):
             "cost_per_input_token": 0.0,
             "cost_per_output_token": 0.0,
         },
+        "/mnt/people/zhuoterq/qwen3-agent-32b-0712": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
+        "/mnt/people/dhantian/public_models/Qwen_Qwen3-32B": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
+        "/mnt/people/dhantian/public_models/Qwen_Qwen3-14B": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
+        "/mnt/people/dhantian/public_models/Qwen_Qwen3-8B": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
+        "/mnt/people/zhuoterq/qwen3-agent-14b-0713": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
+        "/mnt/people/zhuoterq/qwen3-agent-8b-0713": {
+            "max_context": 32_768,
+            "cost_per_input_token": 0.0,
+            "cost_per_output_token": 0.0,
+        },
     }
 
     SHORTCUTS = {
@@ -418,12 +451,12 @@ class OpenAIModel(BaseModel):
         "o1-mini": "o1-mini-2024-09-12",
         "deepseek-r1": "deepseek-reasoner",
         "deepseek-r1-0528": "/mnt/efs/people/dhantian/public_models/DeepSeek-R1-0528/",
-        "qwen2-5-7b": "Qwen/Qwen2.5-7B-Instruct",
-        "qwen2-5-14b": "Qwen/Qwen2.5-14B-Instruct",
-        "qwen2-5-32b": "Qwen/Qwen2.5-32B-Instruct",
-        "qwen3-8b": "Qwen/Qwen3-8B",
-        "qwen3-14b": "Qwen/Qwen3-14B",
-        "qwen3-32b": "Qwen/Qwen3-32B",
+        "qwen2-5-7b": "/mnt/people/dhantian/public_models/Qwen_Qwen2.5-7B-Instruct",
+        "qwen2-5-14b": "/mnt/people/dhantian/public_models/Qwen_Qwen2.5-14B-Instruct",
+        "qwen2-5-32b": "/mnt/people/dhantian/public_models/Qwen_Qwen2.5-32B-Instruct",
+        "qwen3-8b": "/mnt/people/dhantian/public_models/Qwen_Qwen3-8B",
+        "qwen3-14b": "/mnt/people/dhantian/public_models/Qwen_Qwen3-14B",
+        "qwen3-32b": "/mnt/people/dhantian/public_models/Qwen_Qwen3-32B",
         "swe-agent-lm-32b": "SWE-bench/SWE-agent-LM-32B",
         "devstral-small-2505": "mistralai/Devstral-Small-2505",
         "agent-qwen3-step619_0601": "/mnt/efs/people/zhuoterq/agent-qwen3-step619_0601",
@@ -440,7 +473,10 @@ class OpenAIModel(BaseModel):
         "deepseek-v3-0324": "/mnt/people/dhantian/public_models/deepseek-ai_DeepSeek-V3-0324",
         "qwen3-agent-v3-0629": "/mnt/people/zhuoterq/qwen3-agent-v3-0629",
         "qwen3-agnet_14b_0705": "/mnt/people/zhuoterq/qwen3-agnet_14b_0705",
-        "qwen3-agnet_8b_0705": "/mnt/people/zhuoterq/qwen3-agnet_8b_0705"
+        "qwen3-agnet_8b_0705": "/mnt/people/zhuoterq/qwen3-agnet_8b_0705",
+        "qwen3-agent-32b-0712": "/mnt/people/zhuoterq/qwen3-agent-32b-0712",
+        "qwen3-agent-14b-0713": "/mnt/people/zhuoterq/qwen3-agent-14b-0713",
+        "qwen3-agent-8b-0713": "/mnt/people/zhuoterq/qwen3-agent-8b-0713"
     }
 
     def __init__(self, args: ModelArguments, commands: list[Command]):

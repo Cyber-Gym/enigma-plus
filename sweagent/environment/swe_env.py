@@ -2006,10 +2006,51 @@ class SWEEnv(gym.Env):
             buffer, exit_code = read_with_timeout_experimental(
                 self.container, timeout_duration, no_output_timeout_duration
             )
+        except ValueError as e:
+            # Handle the case where process done marker is not found
+            if "Could not find process done marker" in str(e):
+                self.logger.warning(f"Process done marker not found for command: {input[:50]}...")
+                # For state command, try to extract JSON or return minimal state
+                if input.strip() == "state" or "state()" in input:
+                    try:
+                        # Try to extract JSON from the error args if available
+                        error_args = e.args
+                        if len(error_args) > 1 and isinstance(error_args[1], str):
+                            buffer = error_args[1]
+                        else:
+                            buffer = str(e)
+                        
+                        # Try to find JSON in the buffer
+                        json_match = re.search(r'\{[^}]*\}', buffer)
+                        if json_match:
+                            try:
+                                json.loads(json_match.group())  # Validate JSON
+                                buffer = json_match.group()
+                                exit_code = "0"
+                            except json.JSONDecodeError:
+                                # JSON is invalid, create minimal state
+                                buffer = '{"working_dir": ".", "open_file": "n/a", "interactive_session": "n/a"}'
+                                exit_code = "0"
+                        else:
+                            # No JSON found, create minimal state
+                            buffer = '{"working_dir": ".", "open_file": "n/a", "interactive_session": "n/a"}'
+                            exit_code = "0"
+                        self.logger.info("Recovered state command with fallback JSON")
+                    except Exception:
+                        # Absolute fallback
+                        buffer = '{"working_dir": ".", "open_file": "n/a", "interactive_session": "n/a"}'
+                        exit_code = "0"
+                else:
+                    # For non-state commands, return error message
+                    buffer = f"Command execution failed: {input[:50]}..."
+                    exit_code = "999"
+            else:
+                raise  # Re-raise if not the expected error
         except Exception:
             msg = f"Read with timeout failed on input:\n---\n{input}\n---"
             self.logger.error(msg)
             raise
+            
         if exit_code == "$EXITSTATUS":
             # this sometimes happens if the command badly fails
             # for example if you just try to run python with no arguments
@@ -2032,27 +2073,30 @@ class SWEEnv(gym.Env):
                         # No valid JSON found, return minimal state
                         try:
                             current_dir = self._safe_exec_run("pwd", timeout_duration=5, workdir="/")
+                            current_dir = current_dir.strip() if current_dir else "/"
                         except:
                             current_dir = "/"
-                        buffer = f'{{"open_file": "n/a", "working_dir": "{current_dir}", "interactive_session": "n/a"}}'
-                except:
+                        buffer = f'{{"working_dir": "{current_dir}", "open_file": "n/a", "interactive_session": "n/a"}}'
+                except Exception:
                     # Fallback to absolute minimal state if everything fails
-                    buffer = '{"open_file": "n/a", "working_dir": "/", "interactive_session": "n/a"}'
+                    buffer = '{"working_dir": ".", "open_file": "n/a", "interactive_session": "n/a"}'
+                    
                 self.logger.warning("State command failed, returning fallback JSON state")
-                exit_code = 0  # Set successful exit code for state command
+                exit_code = "0"  # Set successful exit code for state command
             else:
                 # For non-state commands, use the original error message
                 buffer = (
-                    "Unkknown error occurred when running the command. Please double check syntax "
+                    "Unknown error occurred when running the command. Please double check syntax "
                     "and that you're not running an interactive command."
                 )
                 self.logger.warning("Couldn't get real exit code. Setting it to 999")
-                exit_code = 999
+                exit_code = "999"
         elif not exit_code.isdigit():
             # this sometimes happens if the command is being killed, for example radare2
             # we set the error to 998 in that case
             self.logger.warning("Couldn't get real exit code. Setting it to 998")
-            exit_code = 998
+            exit_code = "998"
+            
         self.returncode = int(exit_code)
         return buffer
 
