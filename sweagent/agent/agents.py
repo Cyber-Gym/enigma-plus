@@ -5,6 +5,8 @@ import json
 import re
 import time
 import traceback
+import threading
+import queue
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,9 @@ from sweagent.environment.swe_env import SWEEnv
 from sweagent.types import AgentInfo, History, HistoryItem, Trajectory, TrajectoryStep
 from sweagent.utils.config import convert_paths_to_abspath
 from sweagent.utils.log import get_logger
+
+# Import the task timeout constant
+from sweagent.environment.swe_env import TASK_EXECUTION_TIMEOUT, MODEL_GENERATION_TIMEOUT
 
 
 @dataclass(frozen=True)
@@ -370,6 +375,61 @@ class Agent:
         for hook in self.hooks:
             hook.on_query_message_added(**item)
         self.history.append(item)
+
+    def _query_model_with_timeout(self, history: list[dict[str, str]], timeout: float = None) -> str:
+        """
+        Query the model with a timeout to prevent hanging model generation from blocking task timeout.
+        
+        Args:
+            history: Chat history to send to model
+            timeout: Timeout in seconds (default: MODEL_GENERATION_TIMEOUT)
+            
+        Returns:
+            str: Model response
+            
+        Raises:
+            TimeoutError: If model generation exceeds timeout
+            RuntimeError: If model query fails
+        """
+        if timeout is None:
+            timeout = MODEL_GENERATION_TIMEOUT
+            
+        result_queue = queue.Queue()
+        exception_queue = queue.Queue()
+        
+        def model_query_worker():
+            """Worker function to run model query in separate thread"""
+            try:
+                response = self.model.query(history)
+                result_queue.put(response)
+            except Exception as e:
+                exception_queue.put(e)
+        
+        # Start model query in separate thread
+        query_thread = threading.Thread(target=model_query_worker, daemon=True)
+        query_thread.start()
+        
+        # Wait for result with timeout
+        query_thread.join(timeout)
+        
+        if query_thread.is_alive():
+            # Thread is still running - model query timed out
+            self.logger.warning(f"Model generation timed out after {timeout} seconds")
+            # Note: We can't actually kill the thread, but we can stop waiting for it
+            raise TimeoutError(f"Model generation exceeded {timeout} second timeout")
+        
+        # Check if an exception occurred
+        if not exception_queue.empty():
+            exception = exception_queue.get()
+            self.logger.warning(f"Model query failed: {exception}")
+            raise exception
+            
+        # Check if we have a result
+        if not result_queue.empty():
+            return result_queue.get()
+        else:
+            # Thread finished but no result - this shouldn't happen
+            raise RuntimeError("Model query thread finished without result or exception")
 
     # todo: klieret: Long term: Might make more sense to reinitialize the agent class for every instance instead of this
     def setup(self, instance_args: dict[str, Any], init_model_stats: APIStats | None = None) -> None:
@@ -753,7 +813,7 @@ class Agent:
 
         for hook in self.hooks:
             hook.on_model_query(query=self.local_history, agent=self.name)
-        return self.model.query(self.local_history)
+        return self._query_model_with_timeout(self.local_history)
 
     def retry_after_format_fail(self, output: str) -> str:
         """Ask the model to correct (without committing to persistent history) after a malformatted model output"""
@@ -766,7 +826,7 @@ class Agent:
             {"role": "assistant", "content": output, "agent": self.name},
             {"role": "user", "content": format_error_template, "agent": self.name},
         ]
-        return self.model.query(temp_history)
+        return self._query_model_with_timeout(temp_history)
 
     def retry_after_blocklist_fail(self, output: str, action: str) -> str:
         """Ask the model to correct (without committing to persistent history) after a disallowed command"""
@@ -780,7 +840,7 @@ class Agent:
             {"role": "assistant", "content": output, "agent": self.name},
             {"role": "user", "content": blocklist_error_message, "agent": self.name},
         ]
-        return self.model.query(temp_history)
+        return self._query_model_with_timeout(temp_history)
 
     def should_block_action(self, action: str) -> bool:
         """Check if the command should be blocked."""
@@ -1164,7 +1224,37 @@ class Agent:
         for hook in self.hooks:
             hook.on_run_start()
         done = False
+        task_start_time = time.time()  # Track task execution start time
         while not done:
+            # Check if task execution has exceeded the timeout
+            elapsed_time = time.time() - task_start_time
+            if elapsed_time > TASK_EXECUTION_TIMEOUT:
+                self.logger.warning(f"Task execution timed out after {elapsed_time:.1f} seconds (limit: {TASK_EXECUTION_TIMEOUT}s)")
+                self.info["exit_status"] = "task_timeout"
+                self.info["timeout_reason"] = f"Task exceeded {TASK_EXECUTION_TIMEOUT}s timeout"
+                self.info["elapsed_time"] = elapsed_time
+                
+                # Try to get any current observation before terminating
+                try:
+                    observation = f"TASK EXECUTION TIMED OUT after {elapsed_time:.1f} seconds. Maximum allowed time is {TASK_EXECUTION_TIMEOUT} seconds (15 minutes by default). This can be configured with SWE_AGENT_TASK_TIMEOUT environment variable."
+                except Exception:
+                    observation = "TASK EXECUTION TIMED OUT"
+                
+                # Add final trajectory step for timeout
+                if hasattr(self, 'trajectory'):
+                    timeout_step = TrajectoryStep({
+                        "action": "task_timeout",
+                        "observation": observation,
+                        "response": "",
+                        "state": "",
+                        "thought": f"Task execution exceeded timeout limit of {TASK_EXECUTION_TIMEOUT} seconds",
+                        "execution_time": elapsed_time,
+                    })
+                    self.trajectory.append(timeout_step)
+                
+                done = True
+                break
+                
             observation, done = self._run_step(observation)
             self.save_trajectory()
             if done:

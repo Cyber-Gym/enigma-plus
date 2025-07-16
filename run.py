@@ -117,6 +117,8 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
     bypass_step_limit_history: bool = False
     # Start container only without running agents (for debugging/manual interaction)
     container_only: bool = False
+    # Writeup content to append to task description as a hint (avoid mentioning this explicitly during interaction)
+    writeup: str = ""
 
     @property
     def run_name(self) -> str:
@@ -380,7 +382,12 @@ class Main:
         if challenge is not None:
             setup_args["flag_format"] = extract_flag_format(challenge["flag"])
             setup_args["name"] = challenge["name"]
-            setup_args["description"] = challenge["description"]
+            # Handle description with optional writeup content
+            description = challenge["description"]
+            if self.args.writeup:
+                # Add writeup with special splitter - marked as internal hint that should not be explicitly mentioned
+                description += f"\n\n<<<INTERNAL_HINT_SPLITTER_START>>>\n{self.args.writeup}\n<<<INTERNAL_HINT_SPLITTER_END>>>\n\n"
+            setup_args["description"] = description
             setup_args["category_friendly"] = challenge["category_friendly"]
             setup_args["points"] = challenge["points"]
             setup_args["files"] = challenge["files"] or "No files included in this challenge."
@@ -664,6 +671,7 @@ def get_args(args=None) -> ScriptArguments:
         trajectory_path="",
         bypass_step_limit_history=False,
         container_only=False,
+        writeup="",
     )
 
     # Nicer yaml dumping of multiline strings

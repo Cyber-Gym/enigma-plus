@@ -21,6 +21,12 @@ The SWE-agent environment includes comprehensive timeout handling to prevent hun
    - SWE_AGENT_INTERRUPT_TIMEOUT: Time to wait during process interruption (default: 20s)
    - SWE_AGENT_MAX_EXECUTION_RETRIES: Maximum retry attempts for failed commands (default: 2)
 
+4. **Task-Level Timeout**:
+   - SWE_AGENT_TASK_TIMEOUT: Maximum time for entire task execution (default: 900s / 15 minutes)
+
+5. **Model Generation Timeout**:
+   - SWE_AGENT_MODEL_TIMEOUT: Maximum time for individual model queries (default: 300s / 5 minutes)
+
 Common Stuck Execution Scenarios:
 - Long-running filesystem operations (grep -r, find /, etc.)
 - Interactive programs waiting for input
@@ -32,11 +38,15 @@ Environment Variables for Timeout Configuration:
 - Set longer timeouts for complex operations: SWE_AGENT_ACTION_TIMEOUT=60
 - Enable strict timeouts for testing: SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT=10
 - Adjust Docker operation timeouts: SWE_AGENT_DOCKER_EXEC_TIMEOUT=45
+- Set task execution timeout: SWE_AGENT_TASK_TIMEOUT=1800  # 30 minutes
+- Set model generation timeout: SWE_AGENT_MODEL_TIMEOUT=600  # 10 minutes
 
 Usage Example:
     export SWE_AGENT_ACTION_TIMEOUT=45
     export SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT=20
     export SWE_AGENT_MAX_EXECUTION_RETRIES=3
+    export SWE_AGENT_TASK_TIMEOUT=1200  # 20 minutes
+    export SWE_AGENT_MODEL_TIMEOUT=600  # 10 minutes
     python run.py --config config.yaml
 
 The environment will automatically detect and handle most stuck execution scenarios
@@ -128,6 +138,13 @@ DOCKER_EXEC_TIMEOUT = float(keys_config.get("SWE_AGENT_DOCKER_EXEC_TIMEOUT", 30)
 CONTAINER_HEALTH_CHECK_TIMEOUT = float(keys_config.get("SWE_AGENT_CONTAINER_HEALTH_CHECK_TIMEOUT", 5))
 INTERRUPT_TIMEOUT = float(keys_config.get("SWE_AGENT_INTERRUPT_TIMEOUT", 20))
 MAX_EXECUTION_RETRIES = int(keys_config.get("SWE_AGENT_MAX_EXECUTION_RETRIES", 2))
+
+# Task-level timeout configuration (15 minutes = 900 seconds by default)
+TASK_EXECUTION_TIMEOUT = float(keys_config.get("SWE_AGENT_TASK_TIMEOUT", 900))
+
+# Model generation timeout configuration (5 minutes = 300 seconds by default)
+# This prevents individual model queries from blocking task timeout
+MODEL_GENERATION_TIMEOUT = float(keys_config.get("SWE_AGENT_MODEL_TIMEOUT", 300))
 
 
 @dataclass(frozen=True)
