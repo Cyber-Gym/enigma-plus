@@ -1372,8 +1372,7 @@ def get_docker_compose(
     logger.debug(f"Using Docker Compose project name: {project_name}")
     
     startup_cmd = [
-        "docker",
-        "compose",
+        "docker-compose",
         "-f",
         str(actual_compose_path),
         "-p",  # CRITICAL: Use explicit project name to prevent conflicts

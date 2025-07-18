@@ -1,0 +1,83 @@
+# Parallel CTF Challenge Runner Configuration
+# This file contains all configuration options for the parallel runner
+
+# Dataset configuration
+dataset:
+  # Name of the dataset JSON file (without .json extension)
+  # This file should be located in gym-env/{dataset_name}.json
+  name: "ctf_archive"
+  
+  # Optional: Starting challenge index (1-based)
+  # If not specified, starts from the first challenge
+  start_index:
+  
+  # Optional: Ending challenge index (1-based)
+  # If not specified, runs all challenges
+  end_index:
+  
+  # Optional: Path to task_writeup_mapping.json file for CTF writeups
+  # If specified, the runner will randomly sample writeups for each challenge
+  writeup_mapping_file: "/home/ec2-user/gym-env/task_writeup_mapping.json"
+
+# Execution settings
+execution:
+  # Number of times to try each challenge
+  try_times: 2
+  
+  # Number of parallel tasks to run simultaneously
+  parallel_tasks: 25
+  
+  # Whether to disable final cleanup (Docker containers and networks)
+  disable_cleanup: false
+  
+  # Whether to disable initial cleanup (comprehensive Docker cleanup before starting)
+  disable_initial_cleanup: false
+  
+  # Whether to enable log file creation for each challenge
+  # When disabled, logs are only shown in tmux sessions
+  enable_logs: false
+  
+  # Whether to automatically clean up logs when all tasks complete successfully
+  auto_cleanup_logs: true
+  
+  # Maximum wait time in seconds for all sessions to complete
+  max_wait_time: 3600
+  
+  # Delay in seconds between submitting new tasks
+  delay_between_submissions: 2
+
+# Model configuration
+model:
+  # Type of model provider: "aws" or "openai"
+  # This determines which environment variables are required
+  type: "aws"
+  
+  # Name of the model to use for CTF challenges
+  name: "bedrock:us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+# Docker configuration
+docker:
+  # Docker image name to use for CTF challenges
+  image_name: "sweagent/enigma:latest"
+  
+  # Maximum number of steps per instance
+  per_instance_step_limit: 40
+
+# Environment configuration
+environment:
+  # Host URL for the environment
+  host_url: "http://localhost:8000"
+  
+  # OpenAI API key (only used if model.type is "openai")
+  openai_api_key: "dummy"
+  
+  # OpenAI API base URL (only used if model.type is "openai")
+  openai_api_base_url: "http://localhost:30000/v1"
+  
+  # Timeout for SWE agent actions in seconds
+  swe_agent_action_timeout: 20
+
+# SWE Agent configuration
+swe_agent:
+  # Path to the SWE agent configuration file
+  config_file: "config/writeup_ctf.yaml" 

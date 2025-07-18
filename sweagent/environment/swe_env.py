@@ -358,7 +358,7 @@ class SWEEnv(gym.Env):
                     
                     # Use docker-compose down to clean up all services, networks, and volumes
                     down_cmd = [
-                        "docker", "compose", "-f", str(self.docker_compose), 
+                        "docker-compose", "-f", str(self.docker_compose), 
                         "-p", self.docker_compose_project_name,
                         "down", "--volumes", "--remove-orphans"
                     ]
@@ -369,10 +369,10 @@ class SWEEnv(gym.Env):
                         self.logger.warning(f"Docker-compose down failed: {result.stderr}")
                         
                         # Fallback: stop and remove services individually
-                        stop_cmd = ["docker", "compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "stop"]
+                        stop_cmd = ["docker-compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "stop"]
                         subprocess.run(stop_cmd, capture_output=True, timeout=20)
                         
-                        rm_cmd = ["docker", "compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "rm", "-f"]
+                        rm_cmd = ["docker-compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "rm", "-f"]
                         subprocess.run(rm_cmd, capture_output=True, timeout=20)
                         
                 except Exception as e:
@@ -2847,7 +2847,7 @@ class SWEEnv(gym.Env):
                 try:
                     # Use docker-compose restart to restart the services
                     restart_cmd = [
-                        "docker", "compose", "-f", str(self.docker_compose), "restart"
+                        "docker-compose", "-f", str(self.docker_compose), "restart"
                     ]
                     self.logger.debug("Restarting CTF services: %s", shlex.join(restart_cmd))
                     result = subprocess.run(restart_cmd, capture_output=True, text=True, timeout=60)
@@ -3058,7 +3058,7 @@ class SWEEnv(gym.Env):
                 
                 if project_name:
                     restart_cmd = [
-                        "docker", "compose", "-f", str(self.docker_compose), 
+                        "docker-compose", "-f", str(self.docker_compose), 
                         "-p", project_name,
                         "restart"
                     ]
@@ -3082,8 +3082,8 @@ class SWEEnv(gym.Env):
                 else:
                     self.logger.warning("No project name available for restart, trying alternative approach")
                     # Fallback: try to restart using docker-compose down/up
-                    down_cmd = ["docker", "compose", "-f", str(self.docker_compose), "down"]
-                    up_cmd = ["docker", "compose", "-f", str(self.docker_compose), "up", "-d"]
+                    down_cmd = ["docker-compose", "-f", str(self.docker_compose), "down"]
+                    up_cmd = ["docker-compose", "-f", str(self.docker_compose), "up", "-d"]
                     
                     challenge_dir = self.docker_compose.parent
                     subprocess.run(down_cmd, capture_output=True, cwd=str(challenge_dir), timeout=30)
