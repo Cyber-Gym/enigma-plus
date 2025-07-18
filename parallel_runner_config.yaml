@@ -22,7 +22,7 @@ dataset:
 # Execution settings
 execution:
   # Number of times to try each challenge
-  try_times: 2
+  try_times: 3
   
   # Number of parallel tasks to run simultaneously
   parallel_tasks: 25
@@ -54,6 +54,13 @@ model:
   
   # Name of the model to use for CTF challenges
   name: "bedrock:us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+  
+  # Model generation parameters
+  # Temperature controls randomness (0.0 = deterministic, higher = more random)
+  temperature: 0.6
+  
+  # Top-p controls diversity via nucleus sampling (0.0 to 1.0)
+  top_p: 0.95
 
 # Docker configuration
 docker:

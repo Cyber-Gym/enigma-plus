@@ -50,6 +50,8 @@ Configuration:
     model:
       type: "aws"                            # Model provider: "aws" or "openai"
       name: "bedrock:us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+      temperature: 0.0                       # Model temperature (0.0 = deterministic, higher = more random)
+      top_p: 0.95                            # Top-p for nucleus sampling (0.0 to 1.0)
     
     docker:
       image_name: "sweagent/enigma:latest"
@@ -132,6 +134,10 @@ class RunnerConfig:
     per_instance_step_limit: int = 40
     swe_agent_action_timeout: int = 20
     
+    # Model generation parameters
+    temperature: float = 0.0
+    top_p: float = 0.95
+    
     # Execution settings
     max_wait_time: int = 3600
     delay_between_submissions: int = 2
@@ -198,6 +204,8 @@ class RunnerConfig:
                     model_config = yaml_config['model']
                     config.model_type = model_config.get('type', config.model_type)
                     config.model_name = model_config.get('name', config.model_name)
+                    config.temperature = model_config.get('temperature', config.temperature)
+                    config.top_p = model_config.get('top_p', config.top_p)
                 
                 if 'docker' in yaml_config:
                     docker_config = yaml_config['docker']
@@ -882,8 +890,8 @@ class ChallengeRunner:
             "--host_url", self.config.host_url,
             "--per_instance_step_limit", str(self.config.per_instance_step_limit),
             "--trajectory_path", f"trajectories/{self.config.dataset_name}/try{try_num}",
-            "--temperature", "0",
-            "--top_p", "0.95",
+            "--temperature", str(self.config.temperature),
+            "--top_p", str(self.config.top_p),
             "--enable_dynamic_ports",
             "--container_name", container_name,
             "--allow_dirty_repo"
