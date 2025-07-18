@@ -324,10 +324,7 @@ class Main:
         else:
             self.traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
         self.traj_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%y%m%d%H%M%S")
-        log_path = self.traj_dir / f"run-{timestamp}.log"
-        logger.info("Logging to %s", log_path)
-        add_file_handler(log_path)
+        # Remove log file creation from __init__ - will be created per task in run method
         if args.print_config:
             logger.info(f"📙 Arguments: {args.dumps_yaml()}")
         self.args = args
@@ -352,6 +349,15 @@ class Main:
         for hook in self.hooks:
             hook.on_instance_start(index=index, instance=self.env.data[index])
         assert isinstance(instance_id, str)  # mypy
+        
+        # Create log file for this specific task in logs subdirectory
+        timestamp = datetime.datetime.now().strftime("%y%m%d%H%M%S")
+        logs_dir = self.traj_dir / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        log_path = logs_dir / f"{instance_id}-{timestamp}.log"
+        logger.info("Logging to %s", log_path)
+        add_file_handler(log_path)
+        
         if self.should_skip(instance_id):
             for hook in self.hooks:
                 hook.on_instance_skipped()
