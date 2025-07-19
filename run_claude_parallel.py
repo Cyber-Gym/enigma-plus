@@ -877,8 +877,8 @@ rm -f /tmp/command_{session_name}.sh
 # Keep session alive for a moment to capture any final output
 sleep 2
 
-# Exit with the same code as the command - use exec to ensure the shell exits
-exec exit $exit_code
+# Exit with the same code as the command
+exit $exit_code
 """
             
             # Write script to a temporary file
@@ -1336,6 +1336,10 @@ class ChallengeRunner:
         if not self.config.disable_initial_cleanup:
             logger.info("🧹 Performing comprehensive initial cleanup before starting...")
             self.docker_manager.initial_comprehensive_cleanup()
+            
+            # Clean up any existing tmux sessions from previous runs
+            logger.info("🧹 Cleaning up any existing tmux sessions...")
+            self.tmux_manager.cleanup_all_sessions()
             
             # Proactive cleanup of leftover networks from previous runs
             logger.info("🧹 Performing proactive cleanup of leftover networks...")
