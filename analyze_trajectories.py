@@ -356,23 +356,6 @@ def print_results(results: Dict, show_per_model: bool = False):
         
         for challenge_type, stats in sorted_types_by_success:
             print(f"  {challenge_type}: {stats['success_rate']:.1%}")
-        
-        # Print type distribution of unique successful instances
-        print(f"\nType Distribution of Unique Successful Instances:")
-        print("-" * 50)
-        
-        # Calculate total unique successful instances across all types
-        total_unique_successful = sum(len(stats['captured_instances']) for stats in type_distribution.values())
-        
-        if total_unique_successful > 0:
-            # Sort types by number of captured instances (descending)
-            sorted_types_by_captured = sorted(type_distribution.items(), key=lambda x: len(x[1]['captured_instances']), reverse=True)
-            
-            for challenge_type, stats in sorted_types_by_captured:
-                captured_count = len(stats['captured_instances'])
-                if captured_count > 0:
-                    percentage = (captured_count / total_unique_successful) * 100
-                    print(f"  {challenge_type}: {captured_count} ({percentage:.1f}%)")
     else:
         print(f"\nType Distribution: No data available")
     
