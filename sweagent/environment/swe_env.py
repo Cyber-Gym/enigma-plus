@@ -241,10 +241,17 @@ class SWEEnv(gym.Env):
     _created_containers: Set[str] = set()
     _created_networks: Set[str] = set()
     _cleanup_lock = threading.Lock()
+    _signal_handlers_registered = False
+    _active_instances: Set['SWEEnv'] = set()
+    _instance_lock = threading.Lock()
     
     def __init__(self, args: EnvironmentArguments):
         """Initialize the SWE environment with enhanced cleanup tracking"""
         super().__init__()
+        
+        # Register this instance for global cleanup
+        with self._instance_lock:
+            SWEEnv._active_instances.add(self)
         
         # Initialize cleanup tracking
         self._cleanup_done = False
@@ -262,6 +269,9 @@ class SWEEnv(gym.Env):
         self._instance_containers: Set[str] = set()
         self._instance_networks: Set[str] = set()
         
+        # Initialize logger first before registering cleanup handlers
+        self.logger = get_logger("SWEEnv")
+        
         # Register cleanup handlers
         self._register_cleanup_handlers()
         
@@ -271,7 +281,6 @@ class SWEEnv(gym.Env):
         self.communicate_output: str | None = None
         self.container_name: str | None = args.container_name
         self.install_environment = args.install_environment
-        self.logger = get_logger("SWEEnv")
         self.persistent = args.container_name is not None
         self.container_mounts = args.container_mounts
         self.returncode: None | int = None
@@ -337,6 +346,13 @@ class SWEEnv(gym.Env):
             except Exception as e:
                 # Use print instead of logger since logger might not be available during __del__
                 print(f"Warning: Failed to cleanup Docker resources in __del__: {e}")
+        
+        # Remove this instance from active instances
+        try:
+            with self._instance_lock:
+                SWEEnv._active_instances.discard(self)
+        except:
+            pass
 
     def _register_cleanup_handlers(self):
         """Register signal handlers and atexit handlers for reliable cleanup"""
@@ -344,25 +360,62 @@ class SWEEnv(gym.Env):
         atexit.register(self._atexit_cleanup)
         
         # Register signal handlers (only once per process)
-        if not hasattr(SWEEnv, '_signal_handlers_registered'):
-            try:
-                signal.signal(signal.SIGTERM, self._signal_handler)
-                signal.signal(signal.SIGINT, self._signal_handler)
-                # On Windows, also handle SIGBREAK
-                if hasattr(signal, 'SIGBREAK'):
-                    signal.signal(signal.SIGBREAK, self._signal_handler)
-                SWEEnv._signal_handlers_registered = True
-                self.logger.debug("✅ Signal handlers registered for cleanup")
-            except Exception as e:
-                self.logger.warning(f"Failed to register signal handlers: {e}")
+        if not SWEEnv._signal_handlers_registered:
+            with self._cleanup_lock:
+                if not SWEEnv._signal_handlers_registered:  # Double-check pattern
+                    try:
+                        signal.signal(signal.SIGTERM, SWEEnv._global_signal_handler)
+                        signal.signal(signal.SIGINT, SWEEnv._global_signal_handler)
+                        # On Windows, also handle SIGBREAK
+                        if hasattr(signal, 'SIGBREAK'):
+                            signal.signal(signal.SIGBREAK, SWEEnv._global_signal_handler)
+                        SWEEnv._signal_handlers_registered = True
+                        self.logger.debug("✅ Global signal handlers registered for cleanup")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to register signal handlers: {e}")
     
-    def _signal_handler(self, signum, frame):
-        """Handle termination signals to ensure cleanup"""
-        self.logger.info(f"Received signal {signum}, performing emergency cleanup...")
+    @classmethod
+    def _global_signal_handler(cls, signum, frame):
+        """Global signal handler that coordinates cleanup across all active instances"""
+        print(f"Received signal {signum}, performing emergency cleanup for all instances...")
         try:
-            self._emergency_cleanup()
+            # Clean up all active instances
+            with cls._instance_lock:
+                active_instances = list(cls._active_instances)
+            
+            for instance in active_instances:
+                try:
+                    if hasattr(instance, 'logger'):
+                        instance.logger.info(f"Cleaning up instance due to signal {signum}")
+                    instance._emergency_cleanup()
+                except Exception as e:
+                    print(f"Error cleaning up instance: {e}")
+            
+            # Also clean up any global resources
+            with cls._cleanup_lock:
+                try:
+                    client = docker.from_env()
+                    # Clean up any remaining containers and networks
+                    for container_name in cls._created_containers:
+                        try:
+                            container = client.containers.get(container_name)
+                            container.stop(timeout=1)
+                            container.remove(force=True)
+                        except:
+                            pass
+                    
+                    for network_name in cls._created_networks:
+                        try:
+                            network = client.networks.get(network_name)
+                            network.remove()
+                        except:
+                            pass
+                except:
+                    pass
+                    
         except Exception as e:
-            self.logger.error(f"Error during emergency cleanup: {e}")
+            print(f"Error during global emergency cleanup: {e}")
+        
         sys.exit(1)
     
     def _atexit_cleanup(self):
@@ -374,7 +427,14 @@ class SWEEnv(gym.Env):
             except Exception as e:
                 # Use print since logger might not be available during atexit
                 print(f"Warning: Failed to cleanup Docker resources in atexit: {e}")
-    
+        
+        # Remove this instance from active instances
+        try:
+            with self._instance_lock:
+                SWEEnv._active_instances.discard(self)
+        except:
+            pass
+
     def _emergency_cleanup(self):
         """Emergency cleanup for signal handlers - aggressive resource removal"""
         self.logger.warning("🚨 Performing emergency cleanup...")
@@ -1212,6 +1272,14 @@ class SWEEnv(gym.Env):
         # Call hooks
         for hook in self.hooks:
             hook.on_close()
+        
+        # Mark cleanup as done and remove from active instances
+        self._cleanup_done = True
+        try:
+            with self._instance_lock:
+                SWEEnv._active_instances.discard(self)
+        except:
+            pass
 
     # MARK: Helper functions #
 
