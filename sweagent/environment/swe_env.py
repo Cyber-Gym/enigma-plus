@@ -1,3 +1,9 @@
+# CRITICAL FIX: Suppress Modal deprecation warnings that cause script to exit
+# These must be set before any imports that might trigger Modal warnings
+import os
+os.environ['PYTHONWARNINGS'] = 'ignore::DeprecationWarning'
+os.environ['MODAL_SUPPRESS_DEPRECATION_WARNINGS'] = '1'
+
 """
 SWE-agent Environment Module
 
@@ -19,39 +25,27 @@ The SWE-agent environment includes comprehensive timeout handling to prevent hun
 
 3. **Recovery Mechanisms**:
    - SWE_AGENT_INTERRUPT_TIMEOUT: Time to wait during process interruption (default: 20s)
-   - SWE_AGENT_MAX_EXECUTION_RETRIES: Maximum retry attempts for failed commands (default: 2)
 
-4. **Task-Level Timeout**:
-   - SWE_AGENT_TASK_TIMEOUT: Maximum time for entire task execution (default: 900s / 15 minutes)
+CRITICAL CLEANUP IMPROVEMENTS
+============================
 
-5. **Model Generation Timeout**:
-   - SWE_AGENT_MODEL_TIMEOUT: Maximum time for individual model queries (default: 300s / 5 minutes)
+This version includes enhanced cleanup mechanisms to prevent Docker resource exhaustion:
 
-Common Stuck Execution Scenarios:
-- Long-running filesystem operations (grep -r, find /, etc.)
-- Interactive programs waiting for input
-- Network operations that hang
-- Container becoming unresponsive
-- Process deadlocks
-
-Environment Variables for Timeout Configuration:
-- Set longer timeouts for complex operations: SWE_AGENT_ACTION_TIMEOUT=60
-- Enable strict timeouts for testing: SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT=10
-- Adjust Docker operation timeouts: SWE_AGENT_DOCKER_EXEC_TIMEOUT=45
-- Set task execution timeout: SWE_AGENT_TASK_TIMEOUT=1800  # 30 minutes
-- Set model generation timeout: SWE_AGENT_MODEL_TIMEOUT=600  # 10 minutes
-
-Usage Example:
-    export SWE_AGENT_ACTION_TIMEOUT=45
-    export SWE_AGENT_ACTION_NO_OUTPUT_TIMEOUT=20
-    export SWE_AGENT_MAX_EXECUTION_RETRIES=3
-    export SWE_AGENT_TASK_TIMEOUT=1200  # 20 minutes
-    export SWE_AGENT_MODEL_TIMEOUT=600  # 10 minutes
-    python run.py --config config.yaml
-
-The environment will automatically detect and handle most stuck execution scenarios
-with appropriate error messages and recovery attempts.
+1. **Signal Handlers**: Catch SIGTERM, SIGINT, and other signals to ensure cleanup
+2. **Aggressive Network Cleanup**: Always remove networks, not just during final cleanup
+3. **Improved __del__ Method**: More reliable cleanup when objects are garbage collected
+4. **Container Name Tracking**: Better tracking of created containers for cleanup
+5. **Network Name Tracking**: Track all created networks for comprehensive cleanup
+6. **Force Cleanup**: Use force=True for container removal to handle stuck containers
 """
+
+import atexit
+import signal
+import sys
+import threading
+import time
+import traceback
+from typing import Set, Optional
 
 from __future__ import annotations
 
@@ -65,7 +59,6 @@ import re
 import shlex
 import socket
 import subprocess
-import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -245,9 +238,35 @@ class SWEEnv(gym.Env):
     name = "swe_main"
     # This prefix will be prepended to the image name when caching task images
     cached_image_prefix = "swe-agent-task-env-"
-
+    
+    # Global tracking for cleanup (class-level to track across instances)
+    _created_containers: Set[str] = set()
+    _created_networks: Set[str] = set()
+    _cleanup_lock = threading.Lock()
+    
     def __init__(self, args: EnvironmentArguments):
+        """Initialize the SWE environment with enhanced cleanup tracking"""
         super().__init__()
+        
+        # Initialize cleanup tracking
+        self._cleanup_done = False
+        self._container_name = None
+        self._dynamic_network_name = None
+        self._docker_compose_project_name = None
+        self._docker_compose = None
+        self._container_obj = None
+        self._container = None
+        self._interactive_session = None
+        self._hooks = []
+        self._persistent = False
+        
+        # Enhanced cleanup tracking for this instance
+        self._instance_containers: Set[str] = set()
+        self._instance_networks: Set[str] = set()
+        
+        # Register cleanup handlers
+        self._register_cleanup_handlers()
+        
         t0 = time.perf_counter()
         self.args = args
         self.base_commit: str | None = None
@@ -312,16 +331,85 @@ class SWEEnv(gym.Env):
         self.logger.debug("Environment initialization took %.2f seconds", time.perf_counter() - t0)
 
     def __del__(self):
-        """Ensure cleanup happens even if close() isn't called explicitly"""
+        """Enhanced destructor to ensure cleanup happens even if close() isn't called explicitly"""
         if not self._cleanup_done:
             try:
-                self._cleanup_docker_resources(final_cleanup=True)
+                # Use a more aggressive cleanup approach in __del__
+                self._emergency_cleanup()
             except Exception as e:
                 # Use print instead of logger since logger might not be available during __del__
                 print(f"Warning: Failed to cleanup Docker resources in __del__: {e}")
 
+    def _register_cleanup_handlers(self):
+        """Register signal handlers and atexit handlers for reliable cleanup"""
+        # Register atexit handler for this instance
+        atexit.register(self._atexit_cleanup)
+        
+        # Register signal handlers (only once per process)
+        if not hasattr(SWEEnv, '_signal_handlers_registered'):
+            try:
+                signal.signal(signal.SIGTERM, self._signal_handler)
+                signal.signal(signal.SIGINT, self._signal_handler)
+                # On Windows, also handle SIGBREAK
+                if hasattr(signal, 'SIGBREAK'):
+                    signal.signal(signal.SIGBREAK, self._signal_handler)
+                SWEEnv._signal_handlers_registered = True
+                self.logger.debug("✅ Signal handlers registered for cleanup")
+            except Exception as e:
+                self.logger.warning(f"Failed to register signal handlers: {e}")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle termination signals to ensure cleanup"""
+        self.logger.info(f"Received signal {signum}, performing emergency cleanup...")
+        try:
+            self._emergency_cleanup()
+        except Exception as e:
+            self.logger.error(f"Error during emergency cleanup: {e}")
+        sys.exit(1)
+    
+    def _atexit_cleanup(self):
+        """Cleanup handler registered with atexit"""
+        if not self._cleanup_done:
+            try:
+                self.logger.debug("Performing atexit cleanup...")
+                self._cleanup_docker_resources(final_cleanup=True)
+            except Exception as e:
+                # Use print since logger might not be available during atexit
+                print(f"Warning: Failed to cleanup Docker resources in atexit: {e}")
+    
+    def _emergency_cleanup(self):
+        """Emergency cleanup for signal handlers - aggressive resource removal"""
+        self.logger.warning("🚨 Performing emergency cleanup...")
+        
+        try:
+            # Force cleanup all containers created by this instance
+            for container_name in self._instance_containers:
+                try:
+                    client = docker.from_env()
+                    container = client.containers.get(container_name)
+                    self.logger.warning(f"🚨 Force removing container: {container_name}")
+                    container.stop(timeout=1)
+                    container.remove(force=True)
+                except Exception as e:
+                    self.logger.warning(f"Failed to emergency cleanup container {container_name}: {e}")
+            
+            # Force cleanup all networks created by this instance
+            for network_name in self._instance_networks:
+                try:
+                    client = docker.from_env()
+                    network = client.networks.get(network_name)
+                    self.logger.warning(f"🚨 Force removing network: {network_name}")
+                    network.remove()
+                except Exception as e:
+                    self.logger.warning(f"Failed to emergency cleanup network {network_name}: {e}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error during emergency cleanup: {e}")
+        
+        self._cleanup_done = True
+
     def _cleanup_docker_resources(self, final_cleanup: bool = True):
-        """Clean up all Docker resources created by this instance
+        """Enhanced cleanup of all Docker resources created by this instance
         
         Args:
             final_cleanup: If True, this is a final shutdown and all resources should be cleaned up.
@@ -330,134 +418,145 @@ class SWEEnv(gym.Env):
         if self._cleanup_done and final_cleanup:
             return
             
-        try:
-            # 1. Clean up the main container if we know its name
-            if (hasattr(self, 'container_name') and self.container_name is not None and
-                not self.persistent and final_cleanup):
-                # Only remove non-persistent containers during final cleanup
-                try:
-                    client = docker.from_env()
-                    try:
-                        container = client.containers.get(self.container_name)
-                        self.logger.debug(f"🐳 Stopping and removing container: {self.container_name}")
-                        container.stop(timeout=5)
-                        container.remove(force=True)
-                        self.logger.debug(f"✅ Successfully removed container: {self.container_name}")
-                    except docker.errors.NotFound:
-                        self.logger.debug(f"Container {self.container_name} already removed")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to remove container {self.container_name}: {e}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to connect to Docker for container cleanup: {e}")
-            
-            # 2. Clean up docker-compose services if we have a compose file and project name
-            if (hasattr(self, 'docker_compose') and self.docker_compose is not None and
-                hasattr(self, 'docker_compose_project_name') and self.docker_compose_project_name is not None):
-                try:
-                    self.logger.debug(f"🏗️ Cleaning up docker-compose project: {self.docker_compose_project_name}")
+        with self._cleanup_lock:
+            try:
+                # 1. Clean up the main container if we know its name
+                if (hasattr(self, 'container_name') and self.container_name is not None and
+                    not self.persistent and final_cleanup):
+                    # Track container for cleanup
+                    self._instance_containers.add(self.container_name)
                     
-                    # Use docker-compose down to clean up all services, networks, and volumes
-                    down_cmd = [
-                        "docker-compose", "-f", str(self.docker_compose), 
-                        "-p", self.docker_compose_project_name,
-                        "down", "--volumes", "--remove-orphans"
-                    ]
-                    result = subprocess.run(down_cmd, capture_output=True, text=True, timeout=30)
-                    if result.returncode == 0:
-                        self.logger.debug(f"✅ Successfully cleaned up docker-compose project: {self.docker_compose_project_name}")
-                    else:
-                        self.logger.warning(f"Docker-compose down failed: {result.stderr}")
-                        
-                        # Fallback: stop and remove services individually
-                        stop_cmd = ["docker-compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "stop"]
-                        subprocess.run(stop_cmd, capture_output=True, timeout=20)
-                        
-                        rm_cmd = ["docker-compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "rm", "-f"]
-                        subprocess.run(rm_cmd, capture_output=True, timeout=20)
-                        
-                except Exception as e:
-                    self.logger.warning(f"Failed to clean up docker-compose project: {e}")
-            
-            # 3. Clean up the dynamic network if we created one
-            if hasattr(self, 'dynamic_network_name') and self.dynamic_network_name is not None:
-                try:
-                    client = docker.from_env()
+                    # Only remove non-persistent containers during final cleanup
                     try:
-                        network = client.networks.get(self.dynamic_network_name)
-                        self.logger.debug(f"🌐 Removing network: {self.dynamic_network_name}")
-                        
-                        # Force disconnect any remaining containers
+                        client = docker.from_env()
                         try:
-                            network.reload()
-                            containers = network.attrs.get('Containers', {})
-                            for container_id, container_info in containers.items():
-                                container_name = container_info.get('Name', container_id)
-                                # Skip disconnecting persistent containers during reset
-                                if not final_cleanup and self.persistent and container_name == self.container_name:
-                                    self.logger.debug(f"  Preserving persistent container {container_name} connection")
-                                    continue
-                                    
-                                self.logger.debug(f"  📤 Disconnecting container {container_name} from {self.dynamic_network_name}")
-                                try:
-                                    container_obj = client.containers.get(container_id)
-                                    network.disconnect(container_obj, force=True)
-                                except Exception as e:
-                                    self.logger.debug(f"    Failed to disconnect {container_name}: {e}")
+                            container = client.containers.get(self.container_name)
+                            self.logger.debug(f"🐳 Stopping and removing container: {self.container_name}")
+                            container.stop(timeout=5)
+                            container.remove(force=True)
+                            self.logger.debug(f"✅ Successfully removed container: {self.container_name}")
+                        except docker.errors.NotFound:
+                            self.logger.debug(f"Container {self.container_name} already removed")
                         except Exception as e:
-                            self.logger.debug(f"Failed to disconnect containers from network: {e}")
+                            self.logger.warning(f"Failed to remove container {self.container_name}: {e}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to connect to Docker for container cleanup: {e}")
+                
+                # 2. Clean up docker-compose services if we have a compose file and project name
+                if (hasattr(self, 'docker_compose') and self.docker_compose is not None and
+                    hasattr(self, 'docker_compose_project_name') and self.docker_compose_project_name is not None):
+                    try:
+                        self.logger.debug(f"🏗️ Cleaning up docker-compose project: {self.docker_compose_project_name}")
                         
-                        # Only remove the network during final cleanup
-                        if final_cleanup:
+                        # Use docker-compose down to clean up all services, networks, and volumes
+                        down_cmd = [
+                            "docker-compose", "-f", str(self.docker_compose), 
+                            "-p", self.docker_compose_project_name,
+                            "down", "--volumes", "--remove-orphans"
+                        ]
+                        result = subprocess.run(down_cmd, capture_output=True, text=True, timeout=30)
+                        if result.returncode == 0:
+                            self.logger.debug(f"✅ Successfully cleaned up docker-compose project: {self.docker_compose_project_name}")
+                        else:
+                            self.logger.warning(f"Docker-compose down failed: {result.stderr}")
+                            
+                            # Fallback: stop and remove services individually
+                            stop_cmd = ["docker-compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "stop"]
+                            subprocess.run(stop_cmd, capture_output=True, timeout=20)
+                            
+                            rm_cmd = ["docker-compose", "-f", str(self.docker_compose), "-p", self.docker_compose_project_name, "rm", "-f"]
+                            subprocess.run(rm_cmd, capture_output=True, timeout=20)
+                            
+                    except Exception as e:
+                        self.logger.warning(f"Failed to clean up docker-compose project: {e}")
+                
+                # 3. CRITICAL FIX: Always clean up the dynamic network, not just during final cleanup
+                # This prevents network exhaustion in parallel execution
+                if hasattr(self, 'dynamic_network_name') and self.dynamic_network_name is not None:
+                    # Track network for cleanup
+                    self._instance_networks.add(self.dynamic_network_name)
+                    
+                    try:
+                        client = docker.from_env()
+                        try:
+                            network = client.networks.get(self.dynamic_network_name)
+                            self.logger.debug(f"🌐 Removing network: {self.dynamic_network_name}")
+                            
+                            # Force disconnect any remaining containers
+                            try:
+                                network.reload()
+                                containers = network.attrs.get('Containers', {})
+                                for container_id, container_info in containers.items():
+                                    container_name = container_info.get('Name', container_id)
+                                    # Skip disconnecting persistent containers during reset
+                                    if not final_cleanup and self.persistent and container_name == self.container_name:
+                                        self.logger.debug(f"  Preserving persistent container {container_name} connection")
+                                        continue
+                                        
+                                    self.logger.debug(f"  📤 Disconnecting container {container_name} from {self.dynamic_network_name}")
+                                    try:
+                                        container_obj = client.containers.get(container_id)
+                                        network.disconnect(container_obj, force=True)
+                                    except Exception as e:
+                                        self.logger.debug(f"    Failed to disconnect {container_name}: {e}")
+                            except Exception as e:
+                                self.logger.debug(f"Failed to disconnect containers from network: {e}")
+                            
+                            # CRITICAL: Always remove the network to prevent exhaustion
+                            # Don't check final_cleanup - networks should always be cleaned up
                             network.remove()
                             self.logger.debug(f"✅ Successfully removed network: {self.dynamic_network_name}")
-                        
-                    except docker.errors.NotFound:
-                        self.logger.debug(f"Network {self.dynamic_network_name} already removed")
+                            
+                        except docker.errors.NotFound:
+                            self.logger.debug(f"Network {self.dynamic_network_name} already removed")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to remove network {self.dynamic_network_name}: {e}")
                     except Exception as e:
-                        self.logger.warning(f"Failed to remove network {self.dynamic_network_name}: {e}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to connect to Docker for network cleanup: {e}")
+                        self.logger.warning(f"Failed to connect to Docker for network cleanup: {e}")
+                
+                # 4. Clean up temporary docker-compose files
+                if (hasattr(self, 'args') and self.args.enable_dynamic_ports and 
+                    hasattr(self, 'docker_compose') and self.docker_compose is not None and
+                    self.docker_compose.name.startswith('docker-compose-')):
+                    try:
+                        if self.docker_compose.exists():
+                            self.docker_compose.unlink()
+                            self.logger.debug(f"🗑️ Cleaned up temporary docker-compose file: {self.docker_compose}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to clean up temporary docker-compose file: {e}")
+                
+                # 5. Clean up any challenge containers if we have docker-compose project info
+                if (hasattr(self, 'docker_compose_project_name') and self.docker_compose_project_name is not None and
+                    hasattr(self, 'challenge') and self.challenge is not None):
+                    try:
+                        client = docker.from_env()
+                        
+                        # Find containers that belong to our docker-compose project
+                        project_label = f"com.docker.compose.project={self.docker_compose_project_name}"
+                        project_containers = client.containers.list(all=True, filters={"label": project_label})
+                        
+                        if project_containers:
+                            self.logger.debug(f"🧹 Cleaning up {len(project_containers)} containers from project {self.docker_compose_project_name}")
+                            for container in project_containers:
+                                # Track container for cleanup
+                                self._instance_containers.add(container.name)
+                                
+                                try:
+                                    container.stop(timeout=5)
+                                    container.remove(force=True)
+                                    self.logger.debug(f"  ✅ Removed container: {container.name}")
+                                except Exception as e:
+                                    self.logger.debug(f"  Failed to remove container {container.name}: {e}")
+                        
+                    except Exception as e:
+                        self.logger.warning(f"Failed to clean up challenge containers: {e}")
+                        
+            except Exception as e:
+                self.logger.warning(f"Error during Docker resource cleanup: {e}")
             
-            # 4. Clean up temporary docker-compose files
-            if (hasattr(self, 'args') and self.args.enable_dynamic_ports and 
-                hasattr(self, 'docker_compose') and self.docker_compose is not None and
-                self.docker_compose.name.startswith('docker-compose-')):
-                try:
-                    if self.docker_compose.exists():
-                        self.docker_compose.unlink()
-                        self.logger.debug(f"🗑️ Cleaned up temporary docker-compose file: {self.docker_compose}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to clean up temporary docker-compose file: {e}")
-            
-            # 5. Clean up any challenge containers if we have docker-compose project info
-            if (hasattr(self, 'docker_compose_project_name') and self.docker_compose_project_name is not None and
-                hasattr(self, 'challenge') and self.challenge is not None):
-                try:
-                    client = docker.from_env()
-                    
-                    # Find containers that belong to our docker-compose project
-                    project_label = f"com.docker.compose.project={self.docker_compose_project_name}"
-                    project_containers = client.containers.list(all=True, filters={"label": project_label})
-                    
-                    if project_containers:
-                        self.logger.debug(f"🧹 Cleaning up {len(project_containers)} containers from project {self.docker_compose_project_name}")
-                        for container in project_containers:
-                            try:
-                                container.stop(timeout=5)
-                                container.remove(force=True)
-                                self.logger.debug(f"  ✅ Removed container: {container.name}")
-                            except Exception as e:
-                                self.logger.debug(f"  Failed to remove container {container.name}: {e}")
-                    
-                except Exception as e:
-                    self.logger.warning(f"Failed to clean up challenge containers: {e}")
-                    
-        except Exception as e:
-            self.logger.warning(f"Error during Docker resource cleanup: {e}")
-        
-        # Only mark cleanup as done for final cleanup
-        if final_cleanup:
-            self._cleanup_done = True
+            # Only mark cleanup as done for final cleanup
+            if final_cleanup:
+                self._cleanup_done = True
 
     def _get_cached_task_image_name(self) -> str:
         assert self.record is not None
@@ -1170,6 +1269,11 @@ class SWEEnv(gym.Env):
                 container_suffix = self._get_unique_container_suffix()
                 self.dynamic_network_name = f"ctfnet-{container_suffix}"
                 self.logger.info(f"🔗 Using unique network name: {self.dynamic_network_name}")
+                
+                # Track network for cleanup
+                self._instance_networks.add(self.dynamic_network_name)
+                with self._cleanup_lock:
+                    self._created_networks.add(self.dynamic_network_name)
             
             network_name = self.dynamic_network_name if self.dynamic_network_name else "ctfnet"
             
@@ -1927,6 +2031,12 @@ class SWEEnv(gym.Env):
             # Make sure that we get a new container name just in case removing didn't work.
             # Might be a fix for https://github.com/swe-agent/SWE-agent/issues/451
             self.container_name = self._get_container_name(image_name)
+        
+        # Track container for cleanup
+        self._instance_containers.add(self.container_name)
+        with self._cleanup_lock:
+            self._created_containers.add(self.container_name)
+        
         self.container, self.parent_pids = get_container(
             self.container_name, 
             image_name, 

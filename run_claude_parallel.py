@@ -524,10 +524,28 @@ class DockerManager:
     def _cleanup_container_execution(self, container):
         """Clean up a single container from execution (with reduced logging)"""
         try:
-            container.stop(timeout=5)
-            container.remove()
+            # Handle different container states
+            if container.status == 'running':
+                container.stop(timeout=5)
+            elif container.status == 'paused':
+                # Unpause first, then stop
+                container.unpause()
+                container.stop(timeout=5)
+            elif container.status in ['exited', 'dead']:
+                # Container already stopped, just remove
+                pass
+            else:
+                # For other states, try to stop anyway
+                try:
+                    container.stop(timeout=5)
+                except Exception:
+                    pass  # Continue with removal
+            
+            # Force remove the container
+            container.remove(force=True)
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to clean up container {container.name}: {e}")
             return False
     
     def _cleanup_network_execution(self, network):
@@ -563,17 +581,32 @@ class DockerManager:
     def _stop_container_safe(self, container):
         """Safely stop a container with timeout"""
         try:
-            container.stop(timeout=5)  # Reduced timeout
+            # Handle different container states
+            if container.status == 'running':
+                container.stop(timeout=5)  # Reduced timeout
+            elif container.status == 'paused':
+                # Unpause first, then stop
+                container.unpause()
+                container.stop(timeout=5)
+            elif container.status in ['exited', 'dead']:
+                # Container already stopped, just return
+                return True
+            else:
+                # For other states, try to stop anyway
+                container.stop(timeout=5)
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to stop container {container.name}: {e}")
             return False
     
     def _remove_container_safe(self, container):
         """Safely remove a container with timeout"""
         try:
+            # Force remove regardless of state
             container.remove(force=True)
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to remove container {container.name}: {e}")
             return False
     
     def _disconnect_network_safe(self, network):
@@ -656,11 +689,24 @@ class DockerManager:
             container = self.client.containers.get(container_name)
             logger.debug(f"Cleaning up container: {container_name}")
             
-            # Stop the container if it's running
+            # Handle different container states
             if container.status == 'running':
                 container.stop(timeout=5)
+            elif container.status == 'paused':
+                # Unpause first, then stop
+                container.unpause()
+                container.stop(timeout=5)
+            elif container.status in ['exited', 'dead']:
+                # Container already stopped, just remove
+                pass
+            else:
+                # For other states, try to stop anyway
+                try:
+                    container.stop(timeout=5)
+                except Exception:
+                    pass  # Continue with removal
             
-            # Remove the container
+            # Force remove the container
             container.remove(force=True)
             logger.debug(f"Successfully removed container: {container_name}")
             
