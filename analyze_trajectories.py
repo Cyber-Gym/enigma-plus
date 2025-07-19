@@ -477,37 +477,31 @@ def main():
             print(f"\nResults saved to: {args.output}")
         
         if args.instances_by_type:
-            # Create instances by type data
+            # Create instances by type data (only successful instances)
             instances_by_type = {}
             
-            # Get all unique instances and categorize them by type
-            all_instances = results['all_unique_instances']
+            # Get only captured instances and categorize them by type
             captured_instances = results['all_captured_instances']
             
-            for instance_id in all_instances:
+            for instance_id in captured_instances:
                 # Extract challenge type from instance_id (before underscore)
                 challenge_type = instance_id.split('_')[0] if '_' in instance_id else 'unknown'
                 
                 if challenge_type not in instances_by_type:
                     instances_by_type[challenge_type] = {
-                        'all_instances': [],
                         'captured_instances': []
                     }
                 
-                instances_by_type[challenge_type]['all_instances'].append(instance_id)
-                
-                if instance_id in captured_instances:
-                    instances_by_type[challenge_type]['captured_instances'].append(instance_id)
+                instances_by_type[challenge_type]['captured_instances'].append(instance_id)
             
             # Sort instances within each type for consistency
             for challenge_type in instances_by_type:
-                instances_by_type[challenge_type]['all_instances'].sort()
                 instances_by_type[challenge_type]['captured_instances'].sort()
             
             with open(args.instances_by_type, 'w', encoding='utf-8') as f:
                 json.dump(instances_by_type, f, indent=2, ensure_ascii=False)
             
-            print(f"Instances by type saved to: {args.instances_by_type}")
+            print(f"Successful instances by type saved to: {args.instances_by_type}")
             
     except Exception as e:
         print(f"Error: {e}")
