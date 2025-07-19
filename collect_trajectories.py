@@ -180,7 +180,7 @@ def format_trajectory(history: List[Dict]) -> Dict:
     }
 
 
-def process_model_folder(folder_path: Path, min_steps: int = 2, max_tokens: int = TOKEN_LIMIT) -> Tuple[List[Dict], Dict]:
+def process_model_folder(folder_path: Path, min_steps: int = 1, max_tokens: int = TOKEN_LIMIT) -> Tuple[List[Dict], Dict]:
     """
     Process a single model folder to extract successful trajectories.
     
@@ -494,7 +494,7 @@ def main():
     parser.add_argument(
         "--min_steps",
         type=int,
-        default=2,
+        default=1,
         help="Minimum number of steps required to include a trajectory (default: 2)"
     )
     parser.add_argument(
