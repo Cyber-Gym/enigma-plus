@@ -162,6 +162,7 @@ def analyze_trajectories_root(root_path: str) -> Dict:
     all_step_data = []  # List of (instance_id, step_count, folder_path) tuples
     folder_results = {}
     overall_type_stats = {}  # Aggregate type statistics across all folders
+    instance_success_frequency = {}  # Track how many times each instance succeeds
     
     # Find all model result folders that contain all_preds.jsonl
     model_folders = find_model_result_folders(root_path)
@@ -184,7 +185,8 @@ def analyze_trajectories_root(root_path: str) -> Dict:
                 'total_step_counts': []
             },
             'top_5_shortest_trajectories': [],
-            'type_distribution': {}
+            'type_distribution': {},
+            'instance_success_frequency': {}
         }
     
     print(f"Found {len(model_folders)} model result folders with all_preds.jsonl")
@@ -197,6 +199,12 @@ def analyze_trajectories_root(root_path: str) -> Dict:
         print(f"Analyzing {folder_name}...")
         
         captured_count, unique_instances, captured_instances, successful_trajectories, step_data, type_stats = analyze_trajectory_folder(str(folder))
+        
+        # Track instance success frequency
+        for instance_id in captured_instances:
+            if instance_id not in instance_success_frequency:
+                instance_success_frequency[instance_id] = 0
+            instance_success_frequency[instance_id] += 1
         
         # Calculate step statistics for this folder
         folder_step_stats = {}
@@ -316,7 +324,8 @@ def analyze_trajectories_root(root_path: str) -> Dict:
         'all_captured_instances': all_captured_instances,
         'step_statistics': overall_step_stats,
         'top_5_shortest_trajectories': top_5_shortest,
-        'type_distribution': type_distribution
+        'type_distribution': type_distribution,
+        'instance_success_frequency': instance_success_frequency
     }
 
 
@@ -376,6 +385,59 @@ def print_results(results: Dict, show_per_model: bool = False):
             print()
     else:
         print(f"\nTop 5 Shortest Trajectories: No successful trajectories found")
+    
+    # Print success frequency summary
+    frequency_data = results.get('instance_success_frequency', {})
+    if frequency_data:
+        print(f"\nSuccess Frequency Summary:")
+        print("-" * 40)
+        
+        # Calculate frequency statistics
+        frequencies = list(frequency_data.values())
+        max_freq = max(frequencies) if frequencies else 0
+        min_freq = min(frequencies) if frequencies else 0
+        avg_freq = statistics.mean(frequencies) if frequencies else 0
+        median_freq = statistics.median(frequencies) if frequencies else 0
+        
+        # Calculate skewness
+        if len(frequencies) > 2:
+            # Calculate sample standard deviation
+            variance = statistics.variance(frequencies)
+            std_dev = variance ** 0.5
+            
+            # Calculate skewness using the formula: E[(X-μ)³] / σ³
+            skewness = 0
+            for freq in frequencies:
+                skewness += ((freq - avg_freq) ** 3)
+            skewness = skewness / (len(frequencies) * (std_dev ** 3))
+        else:
+            skewness = 0
+        
+        print(f"  Total successful instances: {len(frequency_data)}")
+        print(f"  Maximum success frequency: {max_freq}")
+        print(f"  Minimum success frequency: {min_freq}")
+        print(f"  Average success frequency: {avg_freq:.1f}")
+        print(f"  Median success frequency: {median_freq:.1f}")
+        print(f"  Skewness: {skewness:.3f}")
+        
+        # Interpret skewness
+        if abs(skewness) < 0.5:
+            skew_interpretation = "approximately symmetric"
+        elif skewness > 0.5:
+            skew_interpretation = "right-skewed (few instances with high frequency)"
+        else:
+            skew_interpretation = "left-skewed (many instances with low frequency)"
+        print(f"  Distribution: {skew_interpretation}")
+        
+        # Show top 10 most frequently successful instances
+        sorted_frequency = sorted(frequency_data.items(), key=lambda x: x[1], reverse=True)
+        print(f"\nTop 10 Most Frequently Successful Instances:")
+        print("-" * 50)
+        for i, (instance_id, count) in enumerate(sorted_frequency[:10], 1):
+            challenge_type = instance_id.split('_')[0] if '_' in instance_id else 'unknown'
+            print(f"  {i:2d}. {instance_id} ({challenge_type}): {count} times")
+    else:
+        print(f"\nSuccess Frequency Summary: No successful instances found")
     
     # Print per-model breakdown only if requested
     if show_per_model:
@@ -441,6 +503,10 @@ def main():
         "--instances_by_type",
         help="Output file to save instance IDs categorized by type (optional)"
     )
+    parser.add_argument(
+        "--success_frequency",
+        help="Output file to save sorted success frequency data (optional)"
+    )
     
     args = parser.parse_args()
     
@@ -468,7 +534,8 @@ def main():
                     }
                     for instance_id, step_count, folder_path in results['top_5_shortest_trajectories']
                 ],
-                'type_distribution': results['type_distribution']
+                'type_distribution': results['type_distribution'],
+                'instance_success_frequency': results['instance_success_frequency']
             }
             
             with open(args.output, 'w', encoding='utf-8') as f:
@@ -502,6 +569,54 @@ def main():
                 json.dump(instances_by_type, f, indent=2, ensure_ascii=False)
             
             print(f"Successful instances by type saved to: {args.instances_by_type}")
+        
+        if args.success_frequency:
+            # Create sorted success frequency data
+            frequency_data = results['instance_success_frequency']
+            
+            # Convert to list of tuples and sort by frequency (descending)
+            sorted_frequency = sorted(frequency_data.items(), key=lambda x: x[1], reverse=True)
+            
+            # Calculate skewness for JSON output
+            frequencies = list(frequency_data.values())
+            skewness = 0
+            if len(frequencies) > 2:
+                avg_freq = statistics.mean(frequencies)
+                variance = statistics.variance(frequencies)
+                std_dev = variance ** 0.5
+                
+                # Calculate skewness using the formula: E[(X-μ)³] / σ³
+                for freq in frequencies:
+                    skewness += ((freq - avg_freq) ** 3)
+                skewness = skewness / (len(frequencies) * (std_dev ** 3))
+            
+            # Create output structure
+            success_frequency_output = {
+                'total_folders_analyzed': len(results['folder_results']),
+                'total_unique_instances': results['total_unique_instances'],
+                'total_successful_instances': len(frequency_data),
+                'frequency_statistics': {
+                    'max_frequency': max(frequencies) if frequencies else 0,
+                    'min_frequency': min(frequencies) if frequencies else 0,
+                    'average_frequency': statistics.mean(frequencies) if frequencies else 0,
+                    'median_frequency': statistics.median(frequencies) if frequencies else 0,
+                    'skewness': skewness,
+                    'distribution_type': 'approximately symmetric' if abs(skewness) < 0.5 else ('right-skewed' if skewness > 0.5 else 'left-skewed')
+                },
+                'frequency_distribution': [
+                    {
+                        'instance_id': instance_id,
+                        'success_count': count,
+                        'challenge_type': instance_id.split('_')[0] if '_' in instance_id else 'unknown'
+                    }
+                    for instance_id, count in sorted_frequency
+                ]
+            }
+            
+            with open(args.success_frequency, 'w', encoding='utf-8') as f:
+                json.dump(success_frequency_output, f, indent=2, ensure_ascii=False)
+            
+            print(f"Success frequency data saved to: {args.success_frequency}")
             
     except Exception as e:
         print(f"Error: {e}")
