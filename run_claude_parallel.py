@@ -877,7 +877,8 @@ rm -f /tmp/command_{session_name}.sh
 # Keep session alive for a moment to capture any final output
 sleep 2
 
-# Exit with the same code as the command
+# Exit with the same code as the command and kill the session
+tmux kill-session -t {session_name} 2>/dev/null || true
 exit $exit_code
 """
             
@@ -955,6 +956,30 @@ exit $exit_code
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to kill tmux session {session_name}: {e}")
     
+    def count_running_sessions(self) -> int:
+        """Count actually running tmux sessions with our prefix"""
+        try:
+            result = subprocess.run(
+                ['tmux', 'list-sessions', '-F', '#{{session_name}}'],
+                capture_output=True, text=True, check=True
+            )
+            
+            running_count = 0
+            logger.debug(f"Session prefix: {self.session_prefix}")
+            logger.debug(f"All tmux sessions: {result.stdout.strip()}")
+            
+            for line in result.stdout.strip().split('\n'):
+                if line and line.startswith(self.session_prefix):
+                    running_count += 1
+                    logger.debug(f"Found matching session: {line}")
+            
+            logger.debug(f"Total running sessions with prefix '{self.session_prefix}': {running_count}")
+            return running_count
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to count running tmux sessions: {e}")
+            return 0
+    
     def list_sessions(self) -> List[str]:
         """List all active sessions with our prefix"""
         try:
@@ -990,6 +1015,50 @@ exit $exit_code
                 logger.warning(f"Failed to clean up script file {script_file}: {e}")
         
         logger.info(f"Cleaned up {len(sessions)} tmux sessions")
+    
+    def cleanup_all_ctf_sessions(self):
+        """Clean up ALL CTF-related tmux sessions (from any execution)"""
+        try:
+            result = subprocess.run(
+                ['tmux', 'list-sessions', '-F', '#{session_name}'],
+                capture_output=True, text=True, check=True
+            )
+            
+            ctf_sessions = []
+            for line in result.stdout.strip().split('\n'):
+                if line and line.startswith('swe_'):
+                    ctf_sessions.append(line)
+            
+            if ctf_sessions:
+                logger.info(f"Found {len(ctf_sessions)} CTF-related tmux sessions to clean up")
+                for session in ctf_sessions:
+                    try:
+                        subprocess.run(['tmux', 'kill-session', '-t', session], 
+                                     capture_output=True, text=True, check=True)
+                        logger.debug(f"Killed tmux session: {session}")
+                    except subprocess.CalledProcessError as e:
+                        logger.warning(f"Failed to kill tmux session {session}: {e}")
+                
+                logger.info(f"✅ Cleaned up {len(ctf_sessions)} CTF-related tmux sessions")
+            else:
+                logger.info("ℹ️  No CTF-related tmux sessions found")
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to list tmux sessions: {e}")
+        
+        # Clean up ALL temporary script files (not just current execution)
+        script_pattern = "/tmp/tmux_script_swe_*.sh"
+        script_files_cleaned = 0
+        for script_file in glob.glob(script_pattern):
+            try:
+                Path(script_file).unlink()
+                script_files_cleaned += 1
+                logger.debug(f"Cleaned up script file: {script_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up script file {script_file}: {e}")
+        
+        if script_files_cleaned > 0:
+            logger.info(f"✅ Cleaned up {script_files_cleaned} temporary script files")
 
 
 class ChallengeRunner:
@@ -1215,8 +1284,12 @@ class ChallengeRunner:
             # Clean up finished sessions
             self.cleanup_finished_sessions()
             
-            # Count active sessions
-            active_sessions = len(self.tmux_manager.active_sessions)
+            # Count active sessions using both methods for robustness
+            active_sessions_file = self.tmux_manager.count_running_sessions()
+            active_sessions_tmux = len(self.tmux_manager.list_sessions())
+            
+            # Use the higher count to be safe
+            active_sessions = max(active_sessions_file, active_sessions_tmux)
             
             if active_sessions == 0:
                 logger.info("All sessions completed")
@@ -1224,7 +1297,7 @@ class ChallengeRunner:
             
             # Log progress every 30 seconds
             if time.time() - last_check_time > 30:
-                logger.info(f"⏳ Still waiting for {active_sessions} active sessions...")
+                logger.info(f"⏳ Still waiting for {active_sessions} active sessions... (file: {active_sessions_file}, tmux: {active_sessions_tmux})")
                 last_check_time = time.time()
             
             # Perform aggressive cleanup every 5 minutes to catch stuck sessions
@@ -1339,7 +1412,7 @@ class ChallengeRunner:
             
             # Clean up any existing tmux sessions from previous runs
             logger.info("🧹 Cleaning up any existing tmux sessions...")
-            self.tmux_manager.cleanup_all_sessions()
+            self.tmux_manager.cleanup_all_ctf_sessions()
             
             # Proactive cleanup of leftover networks from previous runs
             logger.info("🧹 Performing proactive cleanup of leftover networks...")
@@ -1432,8 +1505,12 @@ class ChallengeRunner:
                     # Clean up finished sessions
                     self.cleanup_finished_sessions()
                     
-                    # Count active sessions
-                    active_sessions = len(self.tmux_manager.active_sessions)
+                    # Count active sessions using both methods for robustness
+                    active_sessions_file = self.tmux_manager.count_running_sessions()
+                    active_sessions_tmux = len(self.tmux_manager.list_sessions())
+                    
+                    # Use the higher count to be safe
+                    active_sessions = max(active_sessions_file, active_sessions_tmux)
                     
                     if active_sessions >= self.config.parallel_tasks:
                         time.sleep(5)  # Wait before checking again

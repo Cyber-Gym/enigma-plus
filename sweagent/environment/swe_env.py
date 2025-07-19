@@ -153,7 +153,7 @@ class EnvironmentArguments(FrozenSerializable):
     # Specify a branch name or a commit hash to checkout before running the task.
     # Only used when running over a single problem statement/issue.
     base_commit: str | None = None
-    # Use a persistent container with this name. After every task, the container will be paused, but not removed.
+    # Use a persistent container with this name. After every task, the container will be removed.
     # This is useful for speedup when running multiple tasks from the same repositories in a row, as the repositories
     # will have already been cloned and the conda environments will have been installed.
     container_name: str | None = None
@@ -479,12 +479,12 @@ class SWEEnv(gym.Env):
         with self._cleanup_lock:
             try:
                 # 1. Clean up the main container if we know its name
-                if (hasattr(self, 'container_name') and self.container_name is not None and
-                    not self.persistent and final_cleanup):
+                if (hasattr(self, 'container_name') and self.container_name is not None and final_cleanup):
+                    # MODIFIED: Always remove containers for better resource management in parallel execution
                     # Track container for cleanup
                     self._instance_containers.add(self.container_name)
                     
-                    # Only remove non-persistent containers during final cleanup
+                    # Always remove containers during final cleanup (not just non-persistent ones)
                     try:
                         client = docker.from_env()
                         try:
@@ -1246,25 +1246,26 @@ class SWEEnv(gym.Env):
         
         # Handle persistent vs non-persistent containers
         if self.container_obj is not None:
-            if self.persistent:
-                # For persistent containers, just pause them instead of removing
-                assert self.container_name
-                try:
-                    # Get fresh container object since status might not be updated
-                    self.container_obj = docker.from_env().containers.get(self.container_name)
-                    if self.container_obj.status not in {"paused", "exited", "dead", "stopping"}:
-                        try:
-                            self.container_obj.pause()
-                            self.logger.info("Agent container paused")
-                        except Exception:
-                            self.logger.warning("Failed to pause container.", exc_info=True)
-                    else:
-                        self.logger.info(f"Agent container status: {self.container_obj.status}")
-                except Exception:
-                    self.logger.warning(f"Failed to get fresh container object: {traceback.format_exc()}", exc_info=True)
-            else:
-                # For non-persistent containers, they will be cleaned up by _cleanup_docker_resources()
-                pass
+            # MODIFIED: Always remove containers instead of pausing them for better resource management
+            # This prevents resource accumulation in parallel execution
+            assert self.container_name
+            try:
+                # Get fresh container object since status might not be updated
+                self.container_obj = docker.from_env().containers.get(self.container_name)
+                if self.container_obj.status not in {"exited", "dead", "stopping"}:
+                    try:
+                        self.container_obj.stop(timeout=5)
+                        self.container_obj.remove(force=True)
+                        self.logger.info("Agent container removed")
+                    except Exception:
+                        self.logger.warning("Failed to remove container.", exc_info=True)
+                else:
+                    self.logger.info(f"Agent container status: {self.container_obj.status}")
+            except Exception:
+                self.logger.warning(f"Failed to get fresh container object: {traceback.format_exc()}", exc_info=True)
+        else:
+            # For non-persistent containers, they will be cleaned up by _cleanup_docker_resources()
+            pass
         
         # Use the comprehensive Docker resource cleanup
         self._cleanup_docker_resources(final_cleanup=True)
