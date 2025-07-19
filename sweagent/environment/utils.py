@@ -2510,6 +2510,8 @@ class PatchFormatter:
 
 
 def extract_flag_format(flag: str) -> str:
+    if flag == "...":
+        return flag
     flag_format = re.sub(r"{.*}$", "{...}", flag)
     return flag_format if flag_format != flag else "..."
 
