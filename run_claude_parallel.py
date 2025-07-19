@@ -39,6 +39,7 @@ Configuration:
     
     execution:
       try_times: 1                           # Number of times to try each challenge
+      start_try: 1                           # Starting try number (default: 1, must be <= try_times)
       parallel_tasks: 25                     # Number of parallel tasks
       disable_cleanup: false                 # Disable final cleanup
       disable_initial_cleanup: false         # Disable initial cleanup
@@ -114,6 +115,7 @@ class RunnerConfig:
     start_index: Optional[int] = None
     end_index: Optional[int] = None
     try_times: int = 1
+    start_try: int = 1  # New: starting try number (default: 1)
     parallel_tasks: int = 25
     disable_cleanup: bool = False
     disable_initial_cleanup: bool = False  # New flag to control initial cleanup
@@ -181,6 +183,23 @@ class RunnerConfig:
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}. Must be 'aws' or 'openai'")
     
+    def validate_configuration(self):
+        """Validate configuration parameters"""
+        if self.try_times < 1:
+            raise ValueError("try_times must be a positive number")
+        
+        if self.parallel_tasks < 1:
+            raise ValueError("parallel_tasks must be a positive number")
+        
+        if self.start_try < 1:
+            raise ValueError("start_try must be a positive number")
+        
+        if self.start_try > self.try_times:
+            raise ValueError(f"start_try ({self.start_try}) cannot be greater than try_times ({self.try_times})")
+        
+        logger.info(f"✅ Configuration validated: try_times={self.try_times}, start_try={self.start_try}")
+        logger.info(f"✅ Will execute tries {self.start_try} to {self.try_times}")
+    
     @classmethod
     def from_yaml(cls, config_path: Path) -> 'RunnerConfig':
         """Load configuration from YAML file"""
@@ -233,6 +252,7 @@ class RunnerConfig:
                     config.disable_initial_cleanup = exec_config.get('disable_initial_cleanup', config.disable_initial_cleanup)
                     config.enable_logs = exec_config.get('enable_logs', config.enable_logs)
                     config.auto_cleanup_logs = exec_config.get('auto_cleanup_logs', config.auto_cleanup_logs)
+                    config.start_try = exec_config.get('start_try', config.start_try)
                 
                 logger.info(f"Loaded configuration from {config_path}")
                 
@@ -619,7 +639,6 @@ set -x  # Enable debugging to see what's happening
 
 echo "Starting tmux session: {session_name}"
 echo "Working directory: $(pwd)"
-echo "Command to execute: {command}"
 
 # Change to the correct directory
 cd "{Path.cwd()}"
@@ -629,6 +648,7 @@ echo "Changed to directory: $(pwd)"
 if [ ! -f "run.py" ]; then
     echo "ERROR: run.py not found in $(pwd)"
     ls -la
+    echo "COMPLETED_FAILED" > "{status_file if status_file else '/dev/null'}"
     exit 1
 fi
 
@@ -636,17 +656,67 @@ fi
 if ! command -v python &> /dev/null; then
     echo "ERROR: python command not found"
     which python3 || echo "python3 also not found"
+    echo "COMPLETED_FAILED" > "{status_file if status_file else '/dev/null'}"
     exit 1
 fi
 
 # Initialize status file
 echo "RUNNING" > "{status_file if status_file else '/dev/null'}"
 
-# Execute the command and capture exit code with logging
-{command} 2>&1 | tee -a "{log_file if log_file else '/dev/null'}"
+# Write command to a temporary file to avoid escaping issues
+cat > /tmp/command_{session_name}.sh << 'COMMAND_EOF'
+{command}
+COMMAND_EOF
+
+# Make the command file executable
+chmod +x /tmp/command_{session_name}.sh
+
+# Validate the command file syntax
+if ! bash -n /tmp/command_{session_name}.sh; then
+    echo "ERROR: Command file has syntax errors"
+    echo "COMPLETED_FAILED" > "{status_file if status_file else '/dev/null'}"
+    rm -f /tmp/command_{session_name}.sh
+    exit 1
+fi
+
+# Execute the command with comprehensive error handling
+set +e  # Don't exit on error, we'll handle it manually
+if [ -n "{log_file if log_file else ''}" ]; then
+    bash /tmp/command_{session_name}.sh 2>&1 | tee -a "{log_file}"
+else
+    bash /tmp/command_{session_name}.sh 2>&1
+fi
 exit_code=$?
+set -e  # Re-enable exit on error
 
 echo "Command completed with exit code: $exit_code"
+
+# Check for specific error patterns in the output that indicate Docker issues
+if [ $exit_code -ne 0 ]; then
+    # Check if the error was a Docker network issue
+    if [ -n "{log_file if log_file else ''}" ] && [ -f "{log_file}" ]; then
+        if grep -q "failed to create endpoint.*on network.*exchange full" "{log_file}" || \
+           grep -q "docker.errors.APIError.*500 Server Error" "{log_file}" || \
+           grep -q "failed to create endpoint" "{log_file}"; then
+            echo "DETECTED: Docker network error (exchange full) - marking as failed"
+            echo "COMPLETED_FAILED" > "{status_file if status_file else '/dev/null'}"
+            rm -f /tmp/command_{session_name}.sh
+            exit 1
+        fi
+    fi
+    
+    # Check for other common Docker errors
+    if [ -n "{log_file if log_file else ''}" ] && [ -f "{log_file}" ]; then
+        if grep -q "docker.errors" "{log_file}" || \
+           grep -q "Internal Server Error" "{log_file}" || \
+           grep -q "failed to create endpoint" "{log_file}"; then
+            echo "DETECTED: Docker error - marking as failed"
+            echo "COMPLETED_FAILED" > "{status_file if status_file else '/dev/null'}"
+            rm -f /tmp/command_{session_name}.sh
+            exit 1
+        fi
+    fi
+fi
 
 # Update status based on exit code
 if [ $exit_code -eq 0 ]; then
@@ -656,6 +726,9 @@ else
     echo "COMPLETED_FAILED" > "{status_file if status_file else '/dev/null'}"
     echo "Challenge failed with exit code: $exit_code"
 fi
+
+# Clean up command file
+rm -f /tmp/command_{session_name}.sh
 
 # Keep session alive for a moment to capture any final output
 sleep 2
@@ -671,6 +744,23 @@ exec exit $exit_code
             
             # Make script executable
             script_file.chmod(0o755)
+            
+            # Validate the script syntax before creating tmux session
+            try:
+                result = subprocess.run(['bash', '-n', str(script_file)], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode != 0:
+                    logger.error(f"Generated script has syntax errors: {result.stderr}")
+                    script_file.unlink()
+                    return False
+            except subprocess.TimeoutExpired:
+                logger.error(f"Script validation timed out")
+                script_file.unlink()
+                return False
+            except Exception as e:
+                logger.error(f"Error validating script: {e}")
+                script_file.unlink()
+                return False
             
             # Create new session
             result = subprocess.run([
@@ -975,6 +1065,7 @@ class ChallengeRunner:
             
         start_time = time.time()
         last_check_time = start_time
+        last_aggressive_cleanup = start_time
         
         while time.time() - start_time < max_wait_time:
             # Clean up finished sessions
@@ -992,17 +1083,87 @@ class ChallengeRunner:
                 logger.info(f"⏳ Still waiting for {active_sessions} active sessions...")
                 last_check_time = time.time()
             
+            # Perform aggressive cleanup every 5 minutes to catch stuck sessions
+            if time.time() - last_aggressive_cleanup > 300:  # 5 minutes
+                logger.info("🔍 Performing aggressive cleanup check for stuck sessions...")
+                self._aggressive_cleanup_stuck_sessions()
+                last_aggressive_cleanup = time.time()
+            
             time.sleep(10)
         
         if time.time() - start_time >= max_wait_time:
             logger.warning("Timeout reached, forcing cleanup of remaining sessions")
             self.tmux_manager.cleanup_all_sessions()
     
+    def _aggressive_cleanup_stuck_sessions(self):
+        """Aggressively clean up sessions that appear to be stuck"""
+        if not self.active_sessions_file.exists():
+            return
+        
+        try:
+            with open(self.active_sessions_file, 'r') as f:
+                lines = f.readlines()
+            
+            stuck_sessions = []
+            for line in lines:
+                if ':' not in line.strip():
+                    continue
+                
+                session_name, status_file = line.strip().split(':', 1)
+                status_path = Path(status_file)
+                
+                # Check if session exists
+                try:
+                    result = subprocess.run([
+                        'tmux', 'has-session', '-t', session_name
+                    ], capture_output=True, text=True)
+                    
+                    if result.returncode == 0:
+                        # Session exists, check if it's been running too long
+                        if status_path.exists():
+                            try:
+                                stat = status_path.stat()
+                                # If status file hasn't been updated in 30 minutes, consider it stuck
+                                if time.time() - stat.st_mtime > 1800:  # 30 minutes
+                                    stuck_sessions.append((session_name, status_path, "status_file_stale"))
+                            except Exception:
+                                stuck_sessions.append((session_name, status_path, "status_file_error"))
+                        else:
+                            # No status file, check if session has been running too long
+                            # Assume it started 10 minutes ago if no status file
+                            session_start_time = time.time() - 600
+                            if time.time() - session_start_time > 2400:  # 40 minutes total
+                                stuck_sessions.append((session_name, status_path, "no_status_file"))
+                except Exception:
+                    pass
+            
+            # Force cleanup of stuck sessions
+            for session_name, status_path, reason in stuck_sessions:
+                logger.warning(f"Force killing stuck session {session_name} (reason: {reason})")
+                try:
+                    # Update status to failed
+                    status_path.parent.mkdir(exist_ok=True)
+                    with open(status_path, 'w') as sf:
+                        sf.write("COMPLETED_FAILED")
+                except Exception:
+                    pass
+                
+                # Kill the session
+                self.tmux_manager.kill_session(session_name)
+            
+            if stuck_sessions:
+                logger.info(f"Cleaned up {len(stuck_sessions)} stuck sessions")
+                
+        except Exception as e:
+            logger.error(f"Error during aggressive cleanup: {e}")
+    
     def run_parallel(self) -> None:
         """Run challenges in parallel using tmux sessions"""
         logger.info(f"🚀 Starting parallel execution with tmux sessions")
         logger.info(f"📊 Total challenges: {len(self.challenges)}")
         logger.info(f"🔄 Try times: {self.config.try_times}")
+        logger.info(f"🎯 Start try: {self.config.start_try}")
+        logger.info(f"📈 Try range: {self.config.start_try} to {self.config.try_times}")
         logger.info(f"⚡ Parallel tasks: {self.config.parallel_tasks}")
         logger.info(f"🧹 Disable cleanup: {self.config.disable_cleanup}")
         logger.info(f"🧹 Disable initial cleanup: {self.config.disable_initial_cleanup}")
@@ -1074,8 +1235,12 @@ class ChallengeRunner:
             pass  # Create empty file
         
         # Run challenges by try number
-        for try_num in range(1, self.config.try_times + 1):
-            logger.info(f"🔁 Starting Try {try_num} of {self.config.try_times}")
+        total_tries = self.config.try_times - self.config.start_try + 1
+        current_try = 0
+        
+        for try_num in range(self.config.start_try, self.config.try_times + 1):
+            current_try += 1
+            logger.info(f"🔁 Starting Try {try_num} ({current_try}/{total_tries}) of range {self.config.start_try}-{self.config.try_times}")
             
             # Create a pool of tasks for this try
             tasks = []
@@ -1140,7 +1305,7 @@ class ChallengeRunner:
             logger.info(f"⏳ Waiting for {active_sessions} remaining sessions to complete...")
             self.wait_for_completion()
             
-            logger.info(f"✅ Try {try_num} completed")
+            logger.info(f"✅ Try {try_num} ({current_try}/{total_tries}) completed")
         
         # Final cleanup
         if not self.config.disable_cleanup:
@@ -1315,6 +1480,16 @@ class ChallengeRunner:
                 
                 if result.returncode != 0:
                     logger.debug(f"Session {session_name} no longer exists, removing from tracking")
+                    # Update status to failed if session doesn't exist but no status file
+                    status_path = Path(status_file)
+                    if not status_path.exists():
+                        try:
+                            status_path.parent.mkdir(exist_ok=True)
+                            with open(status_path, 'w') as sf:
+                                sf.write("COMPLETED_FAILED")
+                            logger.warning(f"Session {session_name} disappeared without status - marking as failed")
+                        except Exception:
+                            pass
                     continue
             except Exception:
                 continue
@@ -1332,21 +1507,83 @@ class ChallengeRunner:
                         # Kill the tmux session
                         self.tmux_manager.kill_session(session_name)
                     else:
-                        # Keep this session active
-                        active_lines.append(line)
+                        # Check if session has been running too long (timeout)
+                        try:
+                            stat = status_path.stat()
+                            if time.time() - stat.st_mtime > 3600:  # 1 hour timeout
+                                logger.warning(f"Session {session_name} timed out after 1 hour - killing")
+                                with open(status_path, 'w') as sf:
+                                    sf.write("COMPLETED_FAILED")
+                                self.tmux_manager.kill_session(session_name)
+                            else:
+                                # Check for Docker errors in log files that might indicate the session is stuck
+                                log_file = None
+                                if self.config.enable_logs:
+                                    # Try to find the corresponding log file
+                                    log_pattern = f"{self.execution_id}_parallel_*_{session_name.split('_')[-1]}.log"
+                                    log_files = list(self.logs_dir.glob(log_pattern))
+                                    if log_files:
+                                        log_file = log_files[0]
+                                
+                                if log_file and log_file.exists():
+                                    try:
+                                        with open(log_file, 'r') as lf:
+                                            log_content = lf.read()
+                                        
+                                        # Check for Docker errors that indicate the session is stuck
+                                        docker_errors = [
+                                            "failed to create endpoint.*on network.*exchange full",
+                                            "docker.errors.APIError.*500 Server Error",
+                                            "failed to create endpoint",
+                                            "Internal Server Error",
+                                            "docker.errors"
+                                        ]
+                                        
+                                        for error_pattern in docker_errors:
+                                            if error_pattern in log_content:
+                                                logger.warning(f"Session {session_name} has Docker error in logs - killing")
+                                                with open(status_path, 'w') as sf:
+                                                    sf.write("COMPLETED_FAILED")
+                                                self.tmux_manager.kill_session(session_name)
+                                                break
+                                        else:
+                                            # No Docker errors found, keep session active
+                                            active_lines.append(line)
+                                    except Exception:
+                                        # If we can't read the log file, keep session active
+                                        active_lines.append(line)
+                                else:
+                                    # Keep this session active
+                                    active_lines.append(line)
+                        except Exception:
+                            # Keep session active if we can't check timeout
+                            active_lines.append(line)
                 except Exception as e:
                     logger.warning(f"Error reading status file {status_file}: {e}")
                     # Keep session active if we can't read status
                     active_lines.append(line)
             else:
-                # No status file, check if session exists
+                # No status file, check if session exists and has been running too long
                 try:
                     result = subprocess.run([
                         'tmux', 'has-session', '-t', session_name
                     ], capture_output=True, text=True)
                     
                     if result.returncode == 0:
-                        active_lines.append(line)
+                        # Check if session has been running too long without status file
+                        # This handles cases where the script fails to start properly
+                        session_start_time = time.time() - 300  # Assume 5 minutes ago if no status file
+                        if time.time() - session_start_time > 1800:  # 30 minutes timeout for sessions without status
+                            logger.warning(f"Session {session_name} has no status file and may be stuck - killing")
+                            try:
+                                status_path.parent.mkdir(exist_ok=True)
+                                with open(status_path, 'w') as sf:
+                                    sf.write("COMPLETED_FAILED")
+                            except Exception:
+                                pass
+                            self.tmux_manager.kill_session(session_name)
+                        else:
+                            active_lines.append(line)
                 except Exception:
                     pass
         
@@ -1391,11 +1628,7 @@ def main():
         config = RunnerConfig.from_yaml(config_path)
         
         # Validate configuration
-        if config.try_times < 1:
-            raise ValueError("try_times must be a positive number")
-        
-        if config.parallel_tasks < 1:
-            raise ValueError("parallel_tasks must be a positive number")
+        config.validate_configuration()
         
         # Validate environment variables based on model type
         config.validate_environment_variables()

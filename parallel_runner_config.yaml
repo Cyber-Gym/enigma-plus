@@ -22,8 +22,8 @@ dataset:
 # Execution settings
 execution:
   # Number of times to try each challenge
-  try_times: 3
-  
+  try_times: 4
+  start_try: 2
   # Number of parallel tasks to run simultaneously
   parallel_tasks: 25
   
