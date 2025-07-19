@@ -45,6 +45,7 @@ Configuration:
       disable_initial_cleanup: false         # Disable initial cleanup
       enable_logs: false                     # Enable log file creation
       auto_cleanup_logs: true                # Auto-cleanup logs on success
+      enable_per_task_cleanup: true          # Enable per-task Docker cleanup (prevents resource exhaustion)
       max_wait_time: 3600                    # Maximum wait time in seconds
       delay_between_submissions: 2           # Delay between submissions
     
@@ -121,6 +122,7 @@ class RunnerConfig:
     disable_initial_cleanup: bool = False  # New flag to control initial cleanup
     enable_logs: bool = False  # New flag to enable log file creation (disabled by default)
     auto_cleanup_logs: bool = True  # New flag to automatically clean up logs on successful completion
+    enable_per_task_cleanup: bool = True  # New flag to control per-task Docker cleanup (prevents resource exhaustion)
     
     # Writeup settings
     writeup_mapping_file: Optional[str] = None  # Path to task_writeup_mapping.json
@@ -252,6 +254,7 @@ class RunnerConfig:
                     config.disable_initial_cleanup = exec_config.get('disable_initial_cleanup', config.disable_initial_cleanup)
                     config.enable_logs = exec_config.get('enable_logs', config.enable_logs)
                     config.auto_cleanup_logs = exec_config.get('auto_cleanup_logs', config.auto_cleanup_logs)
+                    config.enable_per_task_cleanup = exec_config.get('enable_per_task_cleanup', config.enable_per_task_cleanup)
                     config.start_try = exec_config.get('start_try', config.start_try)
                 
                 logger.info(f"Loaded configuration from {config_path}")
@@ -617,6 +620,101 @@ class DockerManager:
         except Exception as e:
             logger.warning(f"Failed to remove leftover network {network.name}: {e}")
             return False
+    
+    def cleanup_task_resources(self, session_name: str, execution_id: str):
+        """Clean up Docker resources for a specific task based on session name"""
+        if not self.client:
+            return
+        
+        try:
+            # Extract task information from session name
+            # Session name format: swe_{execution_id}_{instance_id}_{challenge_id}_try{try_num}
+            parts = session_name.split('_')
+            if len(parts) >= 5:
+                # Extract instance_id and challenge_id from session name
+                instance_id = parts[2]  # After execution_id
+                challenge_id = parts[3]  # Before try{try_num}
+                try_num = parts[4].replace('try', '')  # Extract try number
+                
+                # Clean up the specific container for this task
+                container_name = f"{execution_id}-parallel-{instance_id}-{challenge_id}-try{try_num}"
+                self._cleanup_task_container(container_name)
+                
+                # Clean up any networks associated with this task
+                self._cleanup_task_networks(execution_id, instance_id, challenge_id, try_num)
+                
+                logger.debug(f"Cleaned up Docker resources for task: {session_name}")
+            else:
+                logger.warning(f"Could not parse session name for cleanup: {session_name}")
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up task resources for {session_name}: {e}")
+    
+    def _cleanup_task_container(self, container_name: str):
+        """Clean up a specific container by name"""
+        try:
+            container = self.client.containers.get(container_name)
+            logger.debug(f"Cleaning up container: {container_name}")
+            
+            # Stop the container if it's running
+            if container.status == 'running':
+                container.stop(timeout=5)
+            
+            # Remove the container
+            container.remove(force=True)
+            logger.debug(f"Successfully removed container: {container_name}")
+            
+        except docker.errors.NotFound:
+            logger.debug(f"Container not found (already cleaned up): {container_name}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up container {container_name}: {e}")
+    
+    def _cleanup_task_networks(self, execution_id: str, instance_id: str, challenge_id: str, try_num: str):
+        """Clean up networks associated with a specific task"""
+        try:
+            # Look for networks that might be associated with this task
+            # Common patterns: ctfnet_{execution_id}_{instance_id}, tmp_ctfnet_{execution_id}_{instance_id}
+            network_patterns = [
+                f"ctfnet_{execution_id}_{instance_id}",
+                f"tmp_ctfnet_{execution_id}_{instance_id}",
+                f"{execution_id}_{instance_id}_default",
+                f"ctfnet_{challenge_id}_{try_num}",
+                f"tmp_ctfnet_{challenge_id}_{try_num}"
+            ]
+            
+            all_networks = self.client.networks.list()
+            cleaned_networks = []
+            
+            for network in all_networks:
+                for pattern in network_patterns:
+                    if pattern in network.name:
+                        try:
+                            logger.debug(f"Cleaning up network: {network.name}")
+                            
+                            # Disconnect any containers from this network
+                            network.reload()
+                            containers = network.attrs.get('Containers', {})
+                            for container_id in containers.keys():
+                                try:
+                                    container = self.client.containers.get(container_id)
+                                    network.disconnect(container, force=True)
+                                except Exception:
+                                    pass  # Continue with other containers
+                            
+                            # Remove the network
+                            network.remove()
+                            cleaned_networks.append(network.name)
+                            logger.debug(f"Successfully removed network: {network.name}")
+                            break  # Don't try other patterns for this network
+                            
+                        except Exception as e:
+                            logger.warning(f"Failed to clean up network {network.name}: {e}")
+            
+            if cleaned_networks:
+                logger.debug(f"Cleaned up {len(cleaned_networks)} networks for task {instance_id}_{challenge_id}_try{try_num}")
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up task networks: {e}")
 
 
 class TmuxManager:
@@ -1150,6 +1248,11 @@ class ChallengeRunner:
                 
                 # Kill the session
                 self.tmux_manager.kill_session(session_name)
+                
+                # Clean up Docker resources for stuck session
+                if self.config.enable_per_task_cleanup:
+                    logger.debug(f"Cleaning up Docker resources for stuck session: {session_name}")
+                    self.docker_manager.cleanup_task_resources(session_name, self.execution_id)
             
             if stuck_sessions:
                 logger.info(f"Cleaned up {len(stuck_sessions)} stuck sessions")
@@ -1169,6 +1272,7 @@ class ChallengeRunner:
         logger.info(f"🧹 Disable initial cleanup: {self.config.disable_initial_cleanup}")
         logger.info(f"🧹 Enable logs: {self.config.enable_logs}")
         logger.info(f"🧹 Auto cleanup logs: {self.config.auto_cleanup_logs}")
+        logger.info(f"🧹 Enable per-task cleanup: {self.config.enable_per_task_cleanup}")
         
         # Log writeup statistics if writeup mapping is loaded
         if self.writeup_mapping and 'task_writeup_mapping' in self.writeup_mapping:
@@ -1488,6 +1592,11 @@ class ChallengeRunner:
                             with open(status_path, 'w') as sf:
                                 sf.write("COMPLETED_FAILED")
                             logger.warning(f"Session {session_name} disappeared without status - marking as failed")
+                            
+                            # Clean up Docker resources for disappeared session
+                            if self.config.enable_per_task_cleanup:
+                                logger.debug(f"Cleaning up Docker resources for disappeared session: {session_name}")
+                                self.docker_manager.cleanup_task_resources(session_name, self.execution_id)
                         except Exception:
                             pass
                     continue
@@ -1506,6 +1615,14 @@ class ChallengeRunner:
                         
                         # Kill the tmux session
                         self.tmux_manager.kill_session(session_name)
+                        
+                        # CRITICAL: Clean up Docker resources for this finished task
+                        # This prevents resource exhaustion as tasks complete
+                        if self.config.enable_per_task_cleanup:
+                            logger.debug(f"Cleaning up Docker resources for finished session: {session_name}")
+                            self.docker_manager.cleanup_task_resources(session_name, self.execution_id)
+                        else:
+                            logger.debug(f"Per-task Docker cleanup disabled - skipping resource cleanup for: {session_name}")
                     else:
                         # Check if session has been running too long (timeout)
                         try:
@@ -1515,6 +1632,11 @@ class ChallengeRunner:
                                 with open(status_path, 'w') as sf:
                                     sf.write("COMPLETED_FAILED")
                                 self.tmux_manager.kill_session(session_name)
+                                
+                                # Clean up Docker resources for timed out session
+                                if self.config.enable_per_task_cleanup:
+                                    logger.debug(f"Cleaning up Docker resources for timed out session: {session_name}")
+                                    self.docker_manager.cleanup_task_resources(session_name, self.execution_id)
                             else:
                                 # Check for Docker errors in log files that might indicate the session is stuck
                                 log_file = None
@@ -1545,6 +1667,11 @@ class ChallengeRunner:
                                                 with open(status_path, 'w') as sf:
                                                     sf.write("COMPLETED_FAILED")
                                                 self.tmux_manager.kill_session(session_name)
+                                                
+                                                # Clean up Docker resources for session with Docker errors
+                                                if self.config.enable_per_task_cleanup:
+                                                    logger.debug(f"Cleaning up Docker resources for session with Docker errors: {session_name}")
+                                                    self.docker_manager.cleanup_task_resources(session_name, self.execution_id)
                                                 break
                                         else:
                                             # No Docker errors found, keep session active
@@ -1582,6 +1709,11 @@ class ChallengeRunner:
                             except Exception:
                                 pass
                             self.tmux_manager.kill_session(session_name)
+                            
+                            # Clean up Docker resources for stuck session without status
+                            if self.config.enable_per_task_cleanup:
+                                logger.debug(f"Cleaning up Docker resources for stuck session without status: {session_name}")
+                                self.docker_manager.cleanup_task_resources(session_name, self.execution_id)
                         else:
                             active_lines.append(line)
                 except Exception:
