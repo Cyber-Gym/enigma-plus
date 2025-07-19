@@ -1,9 +1,3 @@
-# CRITICAL FIX: Suppress Modal deprecation warnings that cause script to exit
-# These must be set before any imports that might trigger Modal warnings
-import os
-os.environ['PYTHONWARNINGS'] = 'ignore::DeprecationWarning'
-os.environ['MODAL_SUPPRESS_DEPRECATION_WARNINGS'] = '1'
-
 """
 SWE-agent Environment Module
 
@@ -47,7 +41,11 @@ import threading
 import time
 import traceback
 from typing import Set, Optional
-
+# CRITICAL FIX: Suppress Modal deprecation warnings that cause script to exit
+# These must be set before any imports that might trigger Modal warnings
+import os
+os.environ['PYTHONWARNINGS'] = 'ignore::DeprecationWarning'
+os.environ['MODAL_SUPPRESS_DEPRECATION_WARNINGS'] = '1'
 
 import datetime
 import hashlib
