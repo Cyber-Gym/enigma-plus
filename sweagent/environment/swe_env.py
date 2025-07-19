@@ -38,6 +38,7 @@ This version includes enhanced cleanup mechanisms to prevent Docker resource exh
 5. **Network Name Tracking**: Track all created networks for comprehensive cleanup
 6. **Force Cleanup**: Use force=True for container removal to handle stuck containers
 """
+from __future__ import annotations
 
 import atexit
 import signal
@@ -47,7 +48,6 @@ import time
 import traceback
 from typing import Set, Optional
 
-from __future__ import annotations
 
 import datetime
 import hashlib
