@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, Set, Tuple, List
 
 
-def analyze_trajectory_folder(folder_path: str) -> Tuple[int, Set[str], Set[str], int, List[Tuple[str, int]]]:
+def analyze_trajectory_folder(folder_path: str) -> Tuple[int, Set[str], Set[str], int, List[Tuple[str, int]], Dict]:
     """
     Analyze a single trajectory folder to count captured flags and unique instances.
     
@@ -29,19 +29,20 @@ def analyze_trajectory_folder(folder_path: str) -> Tuple[int, Set[str], Set[str]
         folder_path: Path to the trajectory folder
         
     Returns:
-        Tuple of (captured_flags_count, unique_instance_ids, captured_instance_ids, total_successful_trajectories, step_data)
+        Tuple of (captured_flags_count, unique_instance_ids, captured_instance_ids, total_successful_trajectories, step_data, type_stats)
     """
     captured_instances = set()
     unique_instances = set()
     successful_trajectories = 0
     step_data = []  # List of (instance_id, step_count) tuples
+    type_stats = {}  # Dictionary to track statistics by challenge type
     
     # Look for all_preds.jsonl file in the folder
     preds_file = Path(folder_path) / "all_preds.jsonl"
     
     if not preds_file.exists():
         print(f"Warning: No all_preds.jsonl found in {folder_path}")
-        return 0, set(), set(), 0, []
+        return 0, set(), set(), 0, [], {}
     
     try:
         with open(preds_file, 'r', encoding='utf-8') as f:
@@ -60,10 +61,26 @@ def analyze_trajectory_folder(folder_path: str) -> Tuple[int, Set[str], Set[str]
                     if instance_id:
                         unique_instances.add(instance_id)
                         
+                        # Extract challenge type from instance_id (before underscore)
+                        challenge_type = instance_id.split('_')[0] if '_' in instance_id else 'unknown'
+                        
+                        # Initialize type stats if not exists
+                        if challenge_type not in type_stats:
+                            type_stats[challenge_type] = {
+                                'total_instances': set(),  # Use set to track unique instances
+                                'captured_instances': set(),  # Use set to track unique instances
+                                'successful_trajectories': 0,
+                                'step_counts': []
+                            }
+                        
+                        type_stats[challenge_type]['total_instances'].add(instance_id)
+                        
                         # Check if flag was captured (model_patch is not null and is a string)
                         if model_patch is not None and isinstance(model_patch, str):
                             captured_instances.add(instance_id)
                             successful_trajectories += 1
+                            type_stats[challenge_type]['captured_instances'].add(instance_id)
+                            type_stats[challenge_type]['successful_trajectories'] += 1
                             
                             # Load trajectory file to count steps
                             traj_file = Path(folder_path) / f"{instance_id}.traj"
@@ -74,14 +91,17 @@ def analyze_trajectory_folder(folder_path: str) -> Tuple[int, Set[str], Set[str]
                                         trajectory = traj_data.get('trajectory', [])
                                         step_count = len(trajectory)
                                         step_data.append((instance_id, step_count))
+                                        type_stats[challenge_type]['step_counts'].append(step_count)
                                 except Exception as e:
                                     print(f"Warning: Could not read trajectory file {traj_file}: {e}")
                                     # Add 0 steps for this trajectory if we can't read it
                                     step_data.append((instance_id, 0))
+                                    type_stats[challenge_type]['step_counts'].append(0)
                             else:
                                 print(f"Warning: No trajectory file found for successful instance {instance_id}")
                                 # Add 0 steps for this trajectory if file doesn't exist
                                 step_data.append((instance_id, 0))
+                                type_stats[challenge_type]['step_counts'].append(0)
                             
                 except json.JSONDecodeError as e:
                     print(f"Warning: Invalid JSON on line {line_num} in {preds_file}: {e}")
@@ -89,9 +109,9 @@ def analyze_trajectory_folder(folder_path: str) -> Tuple[int, Set[str], Set[str]
                     
     except Exception as e:
         print(f"Error reading {preds_file}: {e}")
-        return 0, set(), set(), 0, []
+        return 0, set(), set(), 0, [], {}
     
-    return len(captured_instances), unique_instances, captured_instances, successful_trajectories, step_data
+    return len(captured_instances), unique_instances, captured_instances, successful_trajectories, step_data, type_stats
 
 
 def find_model_result_folders(root_path: Path) -> list:
@@ -141,6 +161,7 @@ def analyze_trajectories_root(root_path: str) -> Dict:
     all_step_counts = []
     all_step_data = []  # List of (instance_id, step_count, folder_path) tuples
     folder_results = {}
+    overall_type_stats = {}  # Aggregate type statistics across all folders
     
     # Find all model result folders that contain all_preds.jsonl
     model_folders = find_model_result_folders(root_path)
@@ -162,7 +183,8 @@ def analyze_trajectories_root(root_path: str) -> Dict:
                 'max_steps': 0,
                 'total_step_counts': []
             },
-            'top_5_shortest_trajectories': []
+            'top_5_shortest_trajectories': [],
+            'type_distribution': {}
         }
     
     print(f"Found {len(model_folders)} model result folders with all_preds.jsonl")
@@ -174,7 +196,7 @@ def analyze_trajectories_root(root_path: str) -> Dict:
         
         print(f"Analyzing {folder_name}...")
         
-        captured_count, unique_instances, captured_instances, successful_trajectories, step_data = analyze_trajectory_folder(str(folder))
+        captured_count, unique_instances, captured_instances, successful_trajectories, step_data, type_stats = analyze_trajectory_folder(str(folder))
         
         # Calculate step statistics for this folder
         folder_step_stats = {}
@@ -208,8 +230,24 @@ def analyze_trajectories_root(root_path: str) -> Dict:
             'unique_instances': unique_instances,
             'captured_instances': captured_instances,
             'full_path': str(folder),
-            'step_statistics': folder_step_stats
+            'step_statistics': folder_step_stats,
+            'type_stats': type_stats
         }
+        
+        # Aggregate type statistics
+        for challenge_type, stats in type_stats.items():
+            if challenge_type not in overall_type_stats:
+                overall_type_stats[challenge_type] = {
+                    'total_instances': set(),
+                    'captured_instances': set(),
+                    'successful_trajectories': 0,
+                    'step_counts': []
+                }
+            
+            overall_type_stats[challenge_type]['total_instances'].update(stats['total_instances'])
+            overall_type_stats[challenge_type]['captured_instances'].update(stats['captured_instances'])
+            overall_type_stats[challenge_type]['successful_trajectories'] += stats['successful_trajectories']
+            overall_type_stats[challenge_type]['step_counts'].extend(stats['step_counts'])
         
         all_unique_instances.update(unique_instances)
         all_captured_instances.update(captured_instances)
@@ -246,6 +284,28 @@ def analyze_trajectories_root(root_path: str) -> Dict:
         sorted_trajectories = sorted(all_step_data, key=lambda x: x[1])
         top_5_shortest = sorted_trajectories[:5]
     
+    # Calculate type distribution statistics
+    type_distribution = {}
+    for challenge_type, stats in overall_type_stats.items():
+        success_rate = len(stats['captured_instances']) / len(stats['total_instances']) if len(stats['total_instances']) > 0 else 0.0
+        
+        type_distribution[challenge_type] = {
+            'total_instances': len(stats['total_instances']),
+            'captured_instances': len(stats['captured_instances']),
+            'successful_trajectories': stats['successful_trajectories'],
+            'success_rate': success_rate,
+            'step_statistics': {}
+        }
+        
+        if stats['step_counts']:
+            type_distribution[challenge_type]['step_statistics'] = {
+                'average_steps': statistics.mean(stats['step_counts']),
+                'median_steps': statistics.median(stats['step_counts']),
+                'min_steps': min(stats['step_counts']),
+                'max_steps': max(stats['step_counts']),
+                'total_trajectories': len(stats['step_counts'])
+            }
+    
     return {
         'total_captured_flags': total_captured_flags,
         'total_unique_instances': total_unique_instances,
@@ -255,11 +315,12 @@ def analyze_trajectories_root(root_path: str) -> Dict:
         'all_unique_instances': all_unique_instances,
         'all_captured_instances': all_captured_instances,
         'step_statistics': overall_step_stats,
-        'top_5_shortest_trajectories': top_5_shortest
+        'top_5_shortest_trajectories': top_5_shortest,
+        'type_distribution': type_distribution
     }
 
 
-def print_results(results: Dict):
+def print_results(results: Dict, show_per_model: bool = False):
     """Print the analysis results in a formatted way."""
     print("\n" + "="*60)
     print("CTF TRAJECTORY ANALYSIS RESULTS")
@@ -283,6 +344,38 @@ def print_results(results: Dict):
     else:
         print(f"\nStep Statistics: No successful trajectories found")
     
+    # Print type distribution
+    type_distribution = results['type_distribution']
+    if type_distribution:
+        # Print simple success rate distribution summary
+        print(f"\nSuccess Rate Distribution by Type:")
+        print("-" * 40)
+        
+        # Sort types by success rate (descending)
+        sorted_types_by_success = sorted(type_distribution.items(), key=lambda x: x[1]['success_rate'], reverse=True)
+        
+        for challenge_type, stats in sorted_types_by_success:
+            print(f"  {challenge_type}: {stats['success_rate']:.1%}")
+        
+        # Print type distribution of unique successful instances
+        print(f"\nType Distribution of Unique Successful Instances:")
+        print("-" * 50)
+        
+        # Calculate total unique successful instances across all types
+        total_unique_successful = sum(len(stats['captured_instances']) for stats in type_distribution.values())
+        
+        if total_unique_successful > 0:
+            # Sort types by number of captured instances (descending)
+            sorted_types_by_captured = sorted(type_distribution.items(), key=lambda x: len(x[1]['captured_instances']), reverse=True)
+            
+            for challenge_type, stats in sorted_types_by_captured:
+                captured_count = len(stats['captured_instances'])
+                if captured_count > 0:
+                    percentage = (captured_count / total_unique_successful) * 100
+                    print(f"  {challenge_type}: {captured_count} ({percentage:.1f}%)")
+    else:
+        print(f"\nType Distribution: No data available")
+    
     # Print top 5 shortest trajectories
     top_5_shortest = results['top_5_shortest_trajectories']
     if top_5_shortest:
@@ -301,27 +394,47 @@ def print_results(results: Dict):
     else:
         print(f"\nTop 5 Shortest Trajectories: No successful trajectories found")
     
-    print(f"\nPer-Model Breakdown:")
-    print("-" * 60)
-    
-    for folder_name, folder_data in results['folder_results'].items():
-        print(f"{folder_name}:")
-        print(f"  Captured flags: {folder_data['captured_flags']}")
-        print(f"  Total instances: {folder_data['total_instances']}")
-        print(f"  Successful trajectories: {folder_data['successful_trajectories']}")
-        print(f"  Success rate: {folder_data['success_rate']:.2%}")
+    # Print per-model breakdown only if requested
+    if show_per_model:
+        print(f"\nPer-Model Breakdown:")
+        print("-" * 60)
         
-        # Print step statistics for this folder
-        folder_step_stats = folder_data['step_statistics']
-        if folder_step_stats['total_step_counts']:
-            print(f"  Step statistics:")
-            print(f"    Average: {folder_step_stats['average_steps']:.1f}")
-            print(f"    Median: {folder_step_stats['median_steps']:.1f}")
-            print(f"    Min: {folder_step_stats['min_steps']}")
-            print(f"    Max: {folder_step_stats['max_steps']}")
-        
-        print(f"  Path: {folder_data['full_path']}")
-        print()
+        for folder_name, folder_data in results['folder_results'].items():
+            print(f"{folder_name}:")
+            print(f"  Captured flags: {folder_data['captured_flags']}")
+            print(f"  Total instances: {folder_data['total_instances']}")
+            print(f"  Successful trajectories: {folder_data['successful_trajectories']}")
+            print(f"  Success rate: {folder_data['success_rate']:.2%}")
+            
+            # Print step statistics for this folder
+            folder_step_stats = folder_data['step_statistics']
+            if folder_step_stats['total_step_counts']:
+                print(f"  Step statistics:")
+                print(f"    Average: {folder_step_stats['average_steps']:.1f}")
+                print(f"    Median: {folder_step_stats['median_steps']:.1f}")
+                print(f"    Min: {folder_step_stats['min_steps']}")
+                print(f"    Max: {folder_step_stats['max_steps']}")
+            
+            # Print type statistics for this folder
+            folder_type_stats = folder_data['type_stats']
+            if folder_type_stats:
+                print(f"  Type Statistics:")
+                for challenge_type, stats in folder_type_stats.items():
+                    print(f"    Challenge Type '{challenge_type}':")
+                    print(f"      Total Instances: {len(stats['total_instances'])}")
+                    print(f"      Captured Instances: {len(stats['captured_instances'])}")
+                    print(f"      Successful Trajectories: {stats['successful_trajectories']}")
+                    if stats['step_counts']:
+                        print(f"      Average Steps: {statistics.mean(stats['step_counts']):.1f}")
+                        print(f"      Median Steps: {statistics.median(stats['step_counts']):.1f}")
+                        print(f"      Min Steps: {min(stats['step_counts'])}")
+                        print(f"      Max Steps: {max(stats['step_counts'])}")
+                        print(f"      Total Trajectories: {len(stats['step_counts'])}")
+                    else:
+                        print(f"      No successful trajectories for this type.")
+            
+            print(f"  Path: {folder_data['full_path']}")
+            print()
 
 
 def main():
@@ -336,12 +449,17 @@ def main():
         "--output", "-o",
         help="Output file to save results as JSON (optional)"
     )
+    parser.add_argument(
+        "--show_per_model",
+        action="store_true",
+        help="Show detailed per-model breakdown (disabled by default)"
+    )
     
     args = parser.parse_args()
     
     try:
         results = analyze_trajectories_root(args.path)
-        print_results(results)
+        print_results(results, args.show_per_model)
         
         if args.output:
             # Save results to JSON file
@@ -362,7 +480,8 @@ def main():
                         'traj_file_path': str(Path(folder_path) / f"{instance_id}.traj")
                     }
                     for instance_id, step_count, folder_path in results['top_5_shortest_trajectories']
-                ]
+                ],
+                'type_distribution': results['type_distribution']
             }
             
             with open(args.output, 'w', encoding='utf-8') as f:
